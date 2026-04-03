@@ -58,7 +58,8 @@ struct TAEScanBindData : public duckdb::TableFunctionData {
 
     // Object list
     std::vector<TAEObjectInfo>     objects;
-    duckdb::idx_t                  total_rows = 0; // sum of all objects' row counts
+    duckdb::idx_t                  total_rows = 0;   // sum of all objects' row counts
+    duckdb::idx_t                  total_blocks = 0;  // sum of all objects' block counts
 };
 
 // ---------------------------------------------------------------------------
@@ -79,12 +80,16 @@ struct TAEScanState : public duckdb::GlobalTableFunctionState {
     // Current reader (one per object file)
     std::unique_ptr<TAEObjectReader> reader;
 
-    // Statistics
+    // Statistics / progress
     uint64_t blocks_scanned = 0;
     uint64_t blocks_skipped = 0;
+    uint64_t rows_emitted = 0;
 
     duckdb::idx_t MaxThreads() const override { return 1; }
 };
+
+// Minimal local state (single-threaded for now)
+struct TAEScanLocalState : public duckdb::LocalTableFunctionState {};
 
 // ---------------------------------------------------------------------------
 // Public API: register the tae_scan table function

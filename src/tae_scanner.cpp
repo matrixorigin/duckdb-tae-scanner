@@ -527,9 +527,13 @@ static void ParseManifest(const std::string &manifest_path,
         bind.objects.push_back(std::move(info));
     }
 
-    // Compute total row count for cardinality estimation
+    // Compute totals for cardinality/progress estimation
     bind.total_rows = 0;
-    for (auto &o : bind.objects) bind.total_rows += o.rows;
+    bind.total_blocks = 0;
+    for (auto &o : bind.objects) {
+        bind.total_rows += o.rows;
+        bind.total_blocks += o.blocks;
+    }
 
     yyjson_doc_free(doc);
 }
@@ -647,6 +651,7 @@ static void TAEScanExecute(duckdb::ClientContext &context,
             duckdb::idx_t filtered_count = ApplyRowFilters(
                 state.filters, decoded_cols, output, row_count);
             if (filtered_count == 0) continue; // all rows filtered out
+            state.rows_emitted += filtered_count;
             return; // one block per call
         }
 
@@ -817,6 +822,74 @@ TAEScanStatistics(duckdb::ClientContext &context,
 }
 
 // ===================================================================
+// Init local — minimal local state (single-threaded for now)
+// ===================================================================
+static duckdb::unique_ptr<duckdb::LocalTableFunctionState>
+TAEScanInitLocal(duckdb::ExecutionContext &context,
+                 duckdb::TableFunctionInitInput &input,
+                 duckdb::GlobalTableFunctionState *global_state) {
+    return duckdb::make_uniq<TAEScanLocalState>();
+}
+
+// ===================================================================
+// Progress — scan completion percentage (0–100)
+// ===================================================================
+static double TAEScanProgress(duckdb::ClientContext &context,
+                              const duckdb::FunctionData *bind_data_p,
+                              const duckdb::GlobalTableFunctionState *global_state) {
+    if (!bind_data_p || !global_state) return -1.0;
+    auto &bind = bind_data_p->Cast<TAEScanBindData>();
+    auto &state = global_state->Cast<TAEScanState>();
+
+    if (bind.total_blocks == 0) return 100.0;
+    double done = static_cast<double>(state.blocks_scanned + state.blocks_skipped);
+    return (done / static_cast<double>(bind.total_blocks)) * 100.0;
+}
+
+// ===================================================================
+// ToString — static info for EXPLAIN output
+// ===================================================================
+static duckdb::InsertionOrderPreservingMap<duckdb::string>
+TAEScanToString(duckdb::TableFunctionToStringInput &input) {
+    duckdb::InsertionOrderPreservingMap<duckdb::string> result;
+    if (!input.bind_data) return result;
+    auto &bind = input.bind_data->Cast<TAEScanBindData>();
+
+    if (!bind.table_name.empty()) {
+        result["Table"] = bind.db_name.empty() ? bind.table_name
+                                                : bind.db_name + "." + bind.table_name;
+    }
+    result["Objects"] = std::to_string(bind.objects.size());
+    result["Total Rows"] = std::to_string(bind.total_rows);
+    result["Total Blocks"] = std::to_string(bind.total_blocks);
+    return result;
+}
+
+// ===================================================================
+// DynamicToString — runtime info for profiling
+// ===================================================================
+static duckdb::InsertionOrderPreservingMap<duckdb::string>
+TAEScanDynamicToString(duckdb::TableFunctionDynamicToStringInput &input) {
+    duckdb::InsertionOrderPreservingMap<duckdb::string> result;
+    if (!input.global_state) return result;
+    auto &state = input.global_state->Cast<TAEScanState>();
+
+    result["Blocks Scanned"] = std::to_string(state.blocks_scanned);
+    result["Blocks Skipped"] = std::to_string(state.blocks_skipped);
+    result["Rows Emitted"] = std::to_string(state.rows_emitted);
+    return result;
+}
+
+// ===================================================================
+// RowsScanned — actual row count for profiling
+// ===================================================================
+static duckdb::idx_t TAEScanRowsScanned(duckdb::GlobalTableFunctionState &global_state,
+                                         duckdb::LocalTableFunctionState &local_state) {
+    auto &state = global_state.Cast<TAEScanState>();
+    return state.rows_emitted;
+}
+
+// ===================================================================
 // GetTAEScanFunction — construct the TableFunction with filter pushdown
 // ===================================================================
 duckdb::TableFunction GetTAEScanFunction() {
@@ -825,11 +898,16 @@ duckdb::TableFunction GetTAEScanFunction() {
                                 TAEScanExecute);
     func.bind = TAEScanBind;
     func.init_global = TAEScanInit;
+    func.init_local = TAEScanInitLocal;
     func.projection_pushdown = true;
     func.filter_pushdown = true;
     func.filter_prune = true;
     func.cardinality = TAEScanCardinality;
     func.statistics = TAEScanStatistics;
+    func.table_scan_progress = TAEScanProgress;
+    func.to_string = TAEScanToString;
+    func.dynamic_to_string = TAEScanDynamicToString;
+    func.rows_scanned = TAEScanRowsScanned;
 
     return func;
 }

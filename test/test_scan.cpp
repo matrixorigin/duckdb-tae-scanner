@@ -266,3 +266,28 @@ TEST_CASE("Scan: column stats min/max respected in range queries", "[scan][stats
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->GetValue(0, 0) == Value::BIGINT(8));
 }
+
+// ===================================================================
+// EXPLAIN output (to_string / dynamic_to_string)
+// ===================================================================
+
+TEST_CASE("Scan: EXPLAIN shows table name and object count", "[scan][explain]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "EXPLAIN SELECT * FROM tae_scan('" +
+                              ManifestPath("manifest_multifile.json") + "')");
+    REQUIRE_FALSE(result->HasError());
+    auto text = result->GetValue(1, 0).ToString();
+    REQUIRE(text.find("test_multifile") != std::string::npos);
+    REQUIRE(text.find("Objects: 2") != std::string::npos);
+    REQUIRE(text.find("Total Rows: 12") != std::string::npos);
+}
+
+TEST_CASE("Scan: EXPLAIN ANALYZE shows runtime stats", "[scan][explain]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "EXPLAIN ANALYZE SELECT * FROM tae_scan('" +
+                              ManifestPath("manifest.json") + "')");
+    REQUIRE_FALSE(result->HasError());
+    auto text = result->GetValue(1, 0).ToString();
+    REQUIRE(text.find("Blocks Scanned") != std::string::npos);
+    REQUIRE(text.find("Rows Emitted") != std::string::npos);
+}
