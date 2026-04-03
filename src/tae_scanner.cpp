@@ -13,6 +13,7 @@
 #include "duckdb/common/types/string_type.hpp"
 #include "duckdb/common/types/date.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/enums/expression_type.hpp"
 #include "duckdb/common/vector/constant_vector.hpp"
@@ -103,6 +104,18 @@ static void CopyVarlenColumn(duckdb::Vector &out_vec,
     }
 }
 
+// MO stores UUID as [16]byte (RFC 4122 big-endian).
+// DuckDB stores UUID as hugeint_t with MSB flipped for sort order.
+static void CopyUuidColumn(duckdb::Vector &out_vec,
+                            const DecodedColumn &col,
+                            duckdb::idx_t count) {
+    auto *dst = duckdb::FlatVector::GetData<duckdb::hugeint_t>(out_vec);
+    const uint8_t *src = col.data.data();
+    for (duckdb::idx_t i = 0; i < count; i++) {
+        dst[i] = duckdb::UUID::FromBlob(src + i * 16);
+    }
+}
+
 static void SetNullMask(duckdb::Vector &out_vec,
                          const DecodedColumn &col,
                          duckdb::idx_t count) {
@@ -185,6 +198,11 @@ static void FillConstantColumn(duckdb::Vector &out_vec,
         duckdb::ConstantVector::GetData<duckdb::string_t>(out_vec)[0] = target;
         break;
     }
+    case MO_T_uuid: {
+        auto *dst = duckdb::ConstantVector::GetData<duckdb::hugeint_t>(out_vec);
+        dst[0] = duckdb::UUID::FromBlob(col.data.data());
+        break;
+    }
     default: {
         auto elem_size = MOTypeFixedSize(oid);
         if (elem_size <= 0) break;
@@ -222,6 +240,9 @@ static void FillColumn(duckdb::Vector &out_vec,
     case MO_T_varbinary:
     case MO_T_datalink:
         CopyVarlenColumn(out_vec, col, count);
+        break;
+    case MO_T_uuid:
+        CopyUuidColumn(out_vec, col, count);
         break;
     default:
         CopyFixedColumn(out_vec, col, count);
@@ -296,6 +317,37 @@ static bool EncodeConstant(const duckdb::Value &val, uint8_t mo_oid,
         // DuckDB timestamp → MO timestamp (add epoch offset)
         auto v = val.GetValue<int64_t>() + MO_UNIX_EPOCH_USEC;
         memcpy(out_bytes.data(), &v, 8);
+        break;
+    }
+    case MO_T_decimal64: {
+        // DuckDB stores scaled integer; physical type depends on width.
+        // MO decimal64 is always int64. Extract and widen to 8 bytes.
+        int64_t v;
+        switch (val.type().InternalType()) {
+        case duckdb::PhysicalType::INT16: v = val.GetValueUnsafe<int16_t>(); break;
+        case duckdb::PhysicalType::INT32: v = val.GetValueUnsafe<int32_t>(); break;
+        case duckdb::PhysicalType::INT64: v = val.GetValueUnsafe<int64_t>(); break;
+        default: return false;
+        }
+        memcpy(out_bytes.data(), &v, 8);
+        break;
+    }
+    case MO_T_decimal128: {
+        duckdb::hugeint_t v;
+        switch (val.type().InternalType()) {
+        case duckdb::PhysicalType::INT16: v = duckdb::hugeint_t(val.GetValueUnsafe<int16_t>()); break;
+        case duckdb::PhysicalType::INT32: v = duckdb::hugeint_t(val.GetValueUnsafe<int32_t>()); break;
+        case duckdb::PhysicalType::INT64: v = duckdb::hugeint_t(val.GetValueUnsafe<int64_t>()); break;
+        case duckdb::PhysicalType::INT128: v = val.GetValueUnsafe<duckdb::hugeint_t>(); break;
+        default: return false;
+        }
+        memcpy(out_bytes.data(), &v, 16);
+        break;
+    }
+    case MO_T_uuid: {
+        // DuckDB UUID → MO big-endian [16]byte
+        auto hi = val.GetValueUnsafe<duckdb::hugeint_t>();
+        duckdb::UUID::ToBlob(hi, out_bytes.data());
         break;
     }
     default: return false;
@@ -394,6 +446,18 @@ static bool EvalFilterOnZoneMap(const PushedFilter &pf,
     case MO_T_uint64:  { uint64_t v; memcpy(&v, pf.constant.data(), 8); return ZoneMapCheckFixed(zm, pf.op, v); }
     case MO_T_float32: { float v;    memcpy(&v, pf.constant.data(), 4); return ZoneMapCheckFixed(zm, pf.op, v); }
     case MO_T_float64: { double v;   memcpy(&v, pf.constant.data(), 8); return ZoneMapCheckFixed(zm, pf.op, v); }
+    case MO_T_decimal64: { int64_t v; memcpy(&v, pf.constant.data(), 8); return ZoneMapCheckFixed(zm, pf.op, v); }
+    case MO_T_decimal128: {
+        duckdb::hugeint_t v; memcpy(&v, pf.constant.data(), 16);
+        return ZoneMapCheckFixed(zm, pf.op, v);
+    }
+    case MO_T_uuid: {
+        // Zone map stores MO UUID as big-endian [16]byte.
+        // Use memcmp for correct UUID ordering.
+        return ZoneMapCheckString(zm, pf.op,
+                                   reinterpret_cast<const char *>(pf.constant.data()),
+                                   pf.const_len);
+    }
     default:
         return true; // unsupported type for zone map → keep block
     }
@@ -504,6 +568,21 @@ static bool RowPassesFilter(const PushedFilter &pf, const DecodedColumn &col,
     case MO_T_float32:   return CompareFixed<float>(pf.op, row_ptr, const_ptr);
     case MO_T_float64:   return CompareFixed<double>(pf.op, row_ptr, const_ptr);
     case MO_T_bool:      return CompareFixed<uint8_t>(pf.op, row_ptr, const_ptr);
+    case MO_T_decimal64: return CompareFixed<int64_t>(pf.op, row_ptr, const_ptr);
+    case MO_T_decimal128: return CompareFixed<duckdb::hugeint_t>(pf.op, row_ptr, const_ptr);
+    case MO_T_uuid: {
+        // Both sides are MO big-endian [16]byte; memcmp gives correct ordering.
+        int cmp = memcmp(row_ptr, const_ptr, 16);
+        switch (pf.op) {
+        case FilterOp::EQUAL:                  return cmp == 0;
+        case FilterOp::NOT_EQUAL:              return cmp != 0;
+        case FilterOp::GREATER_THAN:           return cmp > 0;
+        case FilterOp::GREATER_THAN_OR_EQUAL:  return cmp >= 0;
+        case FilterOp::LESS_THAN:              return cmp < 0;
+        case FilterOp::LESS_THAN_OR_EQUAL:     return cmp <= 0;
+        default: return true;
+        }
+    }
     default: return true;
     }
 }
@@ -875,7 +954,8 @@ TAEScanCardinality(duckdb::ClientContext &context,
 // ===================================================================
 
 // Decode a fixed-width zone-map value to a DuckDB Value.
-static duckdb::Value ZoneMapBytesToValue(const uint8_t *ptr, MOTypeOid oid) {
+static duckdb::Value ZoneMapBytesToValue(const uint8_t *ptr, MOTypeOid oid,
+                                          const duckdb::LogicalType &col_type) {
     switch (oid) {
     case MO_T_int8:      { int8_t v;   memcpy(&v, ptr, sizeof(v));  return duckdb::Value::TINYINT(v); }
     case MO_T_int16:     { int16_t v;  memcpy(&v, ptr, sizeof(v));  return duckdb::Value::SMALLINT(v); }
@@ -896,6 +976,22 @@ static duckdb::Value ZoneMapBytesToValue(const uint8_t *ptr, MOTypeOid oid) {
     case MO_T_timestamp: {
         int64_t v; memcpy(&v, ptr, sizeof(v));
         return duckdb::Value::TIMESTAMP(duckdb::Timestamp::FromEpochMicroSeconds(v));
+    }
+    case MO_T_decimal64: {
+        int64_t v; memcpy(&v, ptr, sizeof(v));
+        auto w = duckdb::DecimalType::GetWidth(col_type);
+        auto s = duckdb::DecimalType::GetScale(col_type);
+        return duckdb::Value::DECIMAL(v, w, s);
+    }
+    case MO_T_decimal128: {
+        duckdb::hugeint_t v; memcpy(&v, ptr, sizeof(v));
+        auto w = duckdb::DecimalType::GetWidth(col_type);
+        auto s = duckdb::DecimalType::GetScale(col_type);
+        return duckdb::Value::DECIMAL(v, w, s);
+    }
+    case MO_T_uuid: {
+        auto v = duckdb::UUID::FromBlob(ptr);
+        return duckdb::Value::UUID(v);
     }
     default: return duckdb::Value();
     }
@@ -960,8 +1056,8 @@ TAEScanStatistics(duckdb::ClientContext &context,
                         if (max_val > global_max) global_max = max_val;
                     }
                 } else {
-                    auto min_val = ZoneMapBytesToValue(zm_min, oid);
-                    auto max_val = ZoneMapBytesToValue(zm_max, oid);
+                    auto min_val = ZoneMapBytesToValue(zm_min, oid, col_type);
+                    auto max_val = ZoneMapBytesToValue(zm_max, oid, col_type);
                     if (min_val.IsNull() || max_val.IsNull()) continue;
                     if (!has_stats) {
                         global_min = min_val;
@@ -999,6 +1095,7 @@ TAEScanStatistics(duckdb::ClientContext &context,
     case duckdb::PhysicalType::FLOAT:
     case duckdb::PhysicalType::DOUBLE:
     case duckdb::PhysicalType::BOOL:
+    case duckdb::PhysicalType::INT128:
         duckdb::NumericStats::SetMin(stats, global_min);
         duckdb::NumericStats::SetMax(stats, global_max);
         break;

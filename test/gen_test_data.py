@@ -63,10 +63,15 @@ ZM_TYPE_OFF     = 63
 ZM_INIT_MASK    = 0x80
 
 # MO Type OIDs
-MO_T_BOOL    = 10
-MO_T_INT32   = 22
-MO_T_FLOAT64 = 31
-MO_T_VARCHAR = 61
+MO_T_BOOL       = 10
+MO_T_INT32      = 22
+MO_T_INT64      = 23
+MO_T_FLOAT64    = 31
+MO_T_DECIMAL64  = 32
+MO_T_DECIMAL128 = 33
+MO_T_VARCHAR    = 61
+MO_T_UUID       = 63
+MO_T_BLOB       = 70
 
 # Varlena
 VARLENA_SIZE       = 24
@@ -102,7 +107,6 @@ def build_zone_map_numeric(mo_type_oid, min_val, max_val, elem_size):
         struct.pack_into('<b', zm, ZM_MIN_OFF, min_val)
     elif elem_size == 4:
         if mo_type_oid == MO_T_FLOAT64:
-            # shouldn't happen for 4-byte but handle gracefully
             struct.pack_into('<f', zm, ZM_MIN_OFF, min_val)
         else:
             struct.pack_into('<i', zm, ZM_MIN_OFF, min_val)
@@ -111,6 +115,12 @@ def build_zone_map_numeric(mo_type_oid, min_val, max_val, elem_size):
             struct.pack_into('<d', zm, ZM_MIN_OFF, min_val)
         else:
             struct.pack_into('<q', zm, ZM_MIN_OFF, min_val)
+    elif elem_size == 16:
+        if isinstance(min_val, bytes):
+            zm[ZM_MIN_OFF:ZM_MIN_OFF + 16] = min_val
+        else:
+            struct.pack_into('<qq', zm, ZM_MIN_OFF, min_val & 0xFFFFFFFFFFFFFFFF,
+                             (min_val >> 64) & 0xFFFFFFFFFFFFFFFF)
     zm[ZM_MIN_LEN_OFF] = min(elem_size, 30)  # min length info
 
     # Pack max value
@@ -126,6 +136,12 @@ def build_zone_map_numeric(mo_type_oid, min_val, max_val, elem_size):
             struct.pack_into('<d', zm, ZM_MAX_OFF, max_val)
         else:
             struct.pack_into('<q', zm, ZM_MAX_OFF, max_val)
+    elif elem_size == 16:
+        if isinstance(max_val, bytes):
+            zm[ZM_MAX_OFF:ZM_MAX_OFF + 16] = max_val
+        else:
+            struct.pack_into('<qq', zm, ZM_MAX_OFF, max_val & 0xFFFFFFFFFFFFFFFF,
+                             (max_val >> 64) & 0xFFFFFFFFFFFFFFFF)
     zm[ZM_MAX_INFO_OFF] = min(elem_size, 30)  # max length info
 
     zm[ZM_SCALE_OFF] = ZM_INIT_MASK  # initialized
@@ -190,11 +206,13 @@ def encode_varlena(s):
     return bytes(slot)
 
 
-def build_vector(mo_type_oid, elem_size, values, nulls=None, is_varchar=False):
+def build_vector(mo_type_oid, elem_size, values, nulls=None, is_varchar=False,
+                 pack_fmt=None, raw_bytes_list=None):
     """Build a complete MO vector binary (what goes after IOEntryHeader).
 
-    For varchar: values is list of str, elem_size is -24 (VARLENA_SIZE marker).
+    For varchar/blob: values is list of str/bytes, elem_size is -24 (VARLENA_SIZE marker).
     For numeric: values is list of int/float, elem_size is the byte width.
+    raw_bytes_list: if provided, list of bytes objects per row (for UUID etc).
     """
     row_count = len(values)
     if nulls is None:
@@ -205,8 +223,11 @@ def build_vector(mo_type_oid, elem_size, values, nulls=None, is_varchar=False):
         area_buf = bytearray()
         data_buf = bytearray()
         for v in values:
-            s = v if v is not None else ''
-            encoded = s.encode('utf-8')
+            if isinstance(v, bytes):
+                encoded = v
+            else:
+                s = v if v is not None else ''
+                encoded = s.encode('utf-8')
             if len(encoded) <= VARLENA_INLINE_MAX:
                 slot = bytearray(VARLENA_SIZE)
                 slot[0] = len(encoded)
@@ -223,13 +244,31 @@ def build_vector(mo_type_oid, elem_size, values, nulls=None, is_varchar=False):
         data_bytes = bytes(data_buf)
         area_bytes = bytes(area_buf)
         actual_elem_size = -24  # varlena marker
+    elif raw_bytes_list is not None:
+        data_bytes = b''.join(raw_bytes_list)
+        area_bytes = b''
+        actual_elem_size = elem_size
     else:
         if mo_type_oid == MO_T_BOOL:
             data_bytes = bytes(1 if v else 0 for v in values)
         elif mo_type_oid == MO_T_INT32:
             data_bytes = b''.join(struct.pack('<i', v if v is not None else 0) for v in values)
+        elif mo_type_oid == MO_T_INT64:
+            data_bytes = b''.join(struct.pack('<q', v if v is not None else 0) for v in values)
         elif mo_type_oid == MO_T_FLOAT64:
             data_bytes = b''.join(struct.pack('<d', v if v is not None else 0.0) for v in values)
+        elif mo_type_oid == MO_T_DECIMAL64:
+            data_bytes = b''.join(struct.pack('<q', v if v is not None else 0) for v in values)
+        elif mo_type_oid == MO_T_DECIMAL128:
+            buf = bytearray()
+            for v in values:
+                val = v if v is not None else 0
+                lo = val & 0xFFFFFFFFFFFFFFFF
+                hi = (val >> 64) & 0xFFFFFFFFFFFFFFFF
+                buf += struct.pack('<QQ', lo, hi)
+            data_bytes = bytes(buf)
+        elif pack_fmt:
+            data_bytes = b''.join(struct.pack(pack_fmt, v if v is not None else 0) for v in values)
         else:
             raise ValueError(f"unsupported type OID {mo_type_oid}")
         area_bytes = b''
@@ -692,6 +731,85 @@ def gen_with_constants(outdir):
     return path
 
 
+def gen_with_types(outdir):
+    """1 block, 5 columns: decimal64, decimal128, uuid, blob, int32 (for reference).
+    6 rows with known values for verification in C++ tests.
+    """
+    import uuid as uuid_mod
+
+    # decimal64: DECIMAL(10,2), stored as int64 (value * 100)
+    # e.g., 123.45 → 12345, -99.99 → -9999
+    dec64_vals = [12345, 67890, -9999, 0, 100, 99999]  # scaled integers
+    # decimal128: DECIMAL(20,4), stored as 128-bit int (value * 10000)
+    dec128_vals = [123456789012345, -987654321098765, 0, 10000, 99999999999999, 1]
+
+    # UUIDs: use fixed known UUIDs (big-endian 16 bytes)
+    uuid_strs = [
+        '00000000-0000-0000-0000-000000000001',
+        '11111111-1111-1111-1111-111111111111',
+        '22222222-2222-2222-2222-222222222222',
+        'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+        'ffffffff-ffff-ffff-ffff-ffffffffffff',
+        '01234567-89ab-cdef-0123-456789abcdef',
+    ]
+    uuid_bytes_list = [uuid_mod.UUID(s).bytes for s in uuid_strs]
+
+    # Blob: raw binary data stored as varlena
+    blob_vals = [
+        b'\x00\x01\x02\x03',
+        b'\xDE\xAD\xBE\xEF',
+        b'hello bytes',
+        b'\xFF' * 10,
+        b'',
+        b'\x00',
+    ]
+
+    int_vals = [1, 2, 3, 4, 5, 6]  # reference column
+
+    builder = TAEFileBuilder()
+    builder.add_block({
+        'rows': 6,
+        'columns': [
+            {
+                'mo_type': MO_T_DECIMAL64,
+                'vector_bytes': build_vector(MO_T_DECIMAL64, 8, dec64_vals),
+                'zone_map': build_zone_map_numeric(MO_T_DECIMAL64, min(dec64_vals), max(dec64_vals), 8),
+                'ndv': len(set(dec64_vals)),
+            },
+            {
+                'mo_type': MO_T_DECIMAL128,
+                'vector_bytes': build_vector(MO_T_DECIMAL128, 16, dec128_vals),
+                'zone_map': build_zone_map_numeric(MO_T_DECIMAL128, min(dec128_vals), max(dec128_vals), 8),
+                'ndv': len(set(dec128_vals)),
+            },
+            {
+                'mo_type': MO_T_UUID,
+                'vector_bytes': build_vector(MO_T_UUID, 16, uuid_strs,
+                                             raw_bytes_list=uuid_bytes_list),
+                'zone_map': build_zone_map_numeric(MO_T_UUID, min(uuid_bytes_list), max(uuid_bytes_list), 16),
+                'ndv': len(uuid_strs),
+            },
+            {
+                'mo_type': MO_T_BLOB,
+                'vector_bytes': build_vector(MO_T_BLOB, -24, blob_vals, is_varchar=True),
+                'zone_map': build_zone_map_string(MO_T_BLOB, '', '\xff' * 10),
+                'ndv': len(blob_vals),
+            },
+            {
+                'mo_type': MO_T_INT32,
+                'vector_bytes': build_vector(MO_T_INT32, 4, int_vals),
+                'zone_map': build_zone_map_numeric(MO_T_INT32, 1, 6, 4),
+                'ndv': 6,
+            },
+        ],
+    })
+
+    path = os.path.join(outdir, 'with_types.tae')
+    with open(path, 'wb') as f:
+        f.write(builder.build())
+    return path, dec64_vals, dec128_vals, uuid_strs, blob_vals, int_vals
+
+
 def gen_manifest(outdir, files):
     """Generate manifest JSON for the test data."""
     manifest = {
@@ -728,6 +846,7 @@ def main():
     nulls_path = gen_with_nulls(outdir)
     part2_path = gen_basic_3col_part2(outdir)
     const_path = gen_with_constants(outdir)
+    types_path, _, _, _, _, _ = gen_with_types(outdir)
 
     gen_manifest(outdir, [basic_path])
 
@@ -781,15 +900,41 @@ def main():
     with open(const_mf_path, 'w') as f:
         json.dump(const_manifest, f, indent=2)
 
+    # Extended types manifest: decimal64, decimal128, uuid, blob, int32
+    types_manifest = {
+        'database': 'test_db',
+        'table': 'test_types',
+        'columns': [
+            {'name': 'col_dec64', 'oid': MO_T_DECIMAL64, 'width': 10, 'scale': 2},
+            {'name': 'col_dec128', 'oid': MO_T_DECIMAL128, 'width': 20, 'scale': 4},
+            {'name': 'col_uuid', 'oid': MO_T_UUID},
+            {'name': 'col_blob', 'oid': MO_T_BLOB},
+            {'name': 'col_ref', 'oid': MO_T_INT32},
+        ],
+        'objects': [
+            {
+                'path': os.path.basename(types_path),
+                'rows': 6,
+                'blocks': 1,
+                'size': os.path.getsize(types_path),
+            },
+        ],
+    }
+    types_mf_path = os.path.join(outdir, 'manifest_types.json')
+    with open(types_mf_path, 'w') as f:
+        json.dump(types_manifest, f, indent=2)
+
     print(f'Generated test data in {outdir}/')
     print(f'  {os.path.basename(basic_path)}  ({os.path.getsize(basic_path)} bytes)')
     print(f'  {os.path.basename(part2_path)}  ({os.path.getsize(part2_path)} bytes)')
     print(f'  {os.path.basename(multi_path)}  ({os.path.getsize(multi_path)} bytes)')
     print(f'  {os.path.basename(nulls_path)}  ({os.path.getsize(nulls_path)} bytes)')
     print(f'  {os.path.basename(const_path)}  ({os.path.getsize(const_path)} bytes)')
+    print(f'  {os.path.basename(types_path)}  ({os.path.getsize(types_path)} bytes)')
     print(f'  manifest.json')
     print(f'  manifest_multifile.json')
     print(f'  manifest_constants.json')
+    print(f'  manifest_types.json')
 
 
 if __name__ == '__main__':

@@ -1,0 +1,38 @@
+{
+  "database": "test_db",
+  "table": "test_types",
+  "columns": [
+    {
+      "name": "col_dec64",
+      "oid": 32,
+      "width": 10,
+      "scale": 2
+    },
+    {
+      "name": "col_dec128",
+      "oid": 33,
+      "width": 20,
+      "scale": 4
+    },
+    {
+      "name": "col_uuid",
+      "oid": 63
+    },
+    {
+      "name": "col_blob",
+      "oid": 70
+    },
+    {
+      "name": "col_ref",
+      "oid": 22
+    }
+  ],
+  "objects": [
+    {
+      "path": "with_types.tae",
+      "rows": 6,
+      "blocks": 1,
+      "size": 2308
+    }
+  ]
+}
