@@ -26,6 +26,7 @@
 #include "duckdb/storage/statistics/string_stats.hpp"
 #include "duckdb/common/constants.hpp"
 #include "duckdb/common/table_column.hpp"
+#include "duckdb/parser/parsed_data/sample_options.hpp"
 
 #include <cstring>
 #include <fstream>
@@ -619,6 +620,21 @@ TAEScanInit(duckdb::ClientContext &context,
         }
     }
 
+    // Sampling pushdown: if DuckDB provides sample_options, apply Bernoulli
+    if (input.sample_options) {
+        auto &opts = *input.sample_options;
+        if (opts.is_percentage) {
+            state->sample_rate = opts.sample_size.GetValue<double>() / 100.0;
+        } else {
+            // Row-count based: approximate as percentage of total rows
+            auto requested = opts.sample_size.GetValue<int64_t>();
+            state->sample_rate = bind.total_rows > 0
+                ? static_cast<double>(requested) / static_cast<double>(bind.total_rows)
+                : 1.0;
+        }
+        state->do_sample = state->sample_rate < 1.0;
+    }
+
     // Build flattened work queue: all (object_idx, block_idx) pairs
     for (uint32_t obj = 0; obj < bind.objects.size(); obj++) {
         for (uint32_t blk = 0; blk < bind.objects[obj].blocks; blk++) {
@@ -738,6 +754,21 @@ static void TAEScanExecute(duckdb::ClientContext &context,
         duckdb::idx_t filtered_count = ApplyRowFilters(
             gstate.filters, decoded_cols, output, row_count);
         if (filtered_count == 0) continue; // all rows filtered out
+
+        // Apply Bernoulli sampling if requested
+        if (gstate.do_sample && lstate) {
+            duckdb::SelectionVector sel(filtered_count);
+            duckdb::idx_t sample_count = 0;
+            for (duckdb::idx_t i = 0; i < filtered_count; i++) {
+                if (lstate->dist(lstate->rng) <= gstate.sample_rate) {
+                    sel.set_index(sample_count++, i);
+                }
+            }
+            if (sample_count == 0) continue;
+            output.Slice(sel, sample_count);
+            filtered_count = sample_count;
+        }
+
         gstate.rows_emitted.fetch_add(filtered_count, std::memory_order_relaxed);
         return;
     }
@@ -1022,6 +1053,7 @@ duckdb::TableFunction GetTAEScanFunction() {
     func.rows_scanned = TAEScanRowsScanned;
     func.get_virtual_columns = TAEScanGetVirtualColumns;
     func.supports_pushdown_type = TAEScanSupportsPushdownType;
+    func.sampling_pushdown = true;
 
     return func;
 }

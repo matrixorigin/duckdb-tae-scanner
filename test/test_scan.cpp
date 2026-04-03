@@ -400,3 +400,45 @@ TEST_CASE("Scan: virtual columns with multi-file show different file paths", "[s
     CHECK(fp_last.find("basic_3col_part2.tae") != std::string::npos);
     CHECK(fp_first != fp_last);
 }
+
+// ===================================================================
+// Sampling pushdown
+// ===================================================================
+
+TEST_CASE("Scan: TABLESAMPLE SYSTEM returns subset of rows", "[scan][sample]") {
+    auto db = MakeDB();
+    // 50% system sample of 8 rows — should return fewer than 8 most of the time.
+    // Run multiple times to avoid flaky failures from randomness.
+    bool saw_fewer = false;
+    for (int trial = 0; trial < 10; trial++) {
+        auto result = Query(*db, "SELECT col_int FROM tae_scan('" +
+                                  ManifestPath("manifest.json") +
+                                  "') TABLESAMPLE SYSTEM(50%)");
+        if (result->HasError()) { UNSCOPED_INFO("Error: " << result->GetError()); }
+        REQUIRE_FALSE(result->HasError());
+        CHECK(result->RowCount() <= 8);
+        if (result->RowCount() < 8) saw_fewer = true;
+    }
+    CHECK(saw_fewer);
+}
+
+TEST_CASE("Scan: TABLESAMPLE SYSTEM 100% returns all rows", "[scan][sample]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT col_int FROM tae_scan('" +
+                              ManifestPath("manifest.json") +
+                              "') TABLESAMPLE SYSTEM(100%)");
+    if (result->HasError()) { UNSCOPED_INFO("Error: " << result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 8);
+}
+
+TEST_CASE("Scan: TABLESAMPLE SYSTEM 0% returns no rows", "[scan][sample]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT col_int FROM tae_scan('" +
+                              ManifestPath("manifest.json") +
+                              "') TABLESAMPLE SYSTEM(0%)");
+    if (result->HasError()) { UNSCOPED_INFO("Error: " << result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+    // 0% should return 0 rows (rate=0, all rows rejected)
+    REQUIRE(result->RowCount() == 0);
+}

@@ -17,6 +17,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -97,6 +98,10 @@ struct TAEScanState : public duckdb::GlobalTableFunctionState {
     // Pushed-down filters (populated from DuckDB TableFilterSet)
     std::vector<PushedFilter>      filters;
 
+    // Sampling pushdown
+    double                         sample_rate = 1.0;  // 1.0 = no sampling
+    bool                           do_sample = false;
+
     // Flattened work queue: all (object_idx, block_idx) pairs
     std::vector<WorkUnit>          work_units;
     std::atomic<duckdb::idx_t>     next_work_unit{0};
@@ -118,6 +123,10 @@ struct TAEScanLocalState : public duckdb::LocalTableFunctionState {
     // Per-thread reader (avoids locking on file I/O)
     std::unique_ptr<TAEObjectReader> reader;
     uint32_t                         reader_object_idx = UINT32_MAX;
+
+    // Per-thread RNG for Bernoulli sampling
+    std::mt19937_64                  rng{std::random_device{}()};
+    std::uniform_real_distribution<double> dist{0.0, 1.0};
 };
 
 // ---------------------------------------------------------------------------
