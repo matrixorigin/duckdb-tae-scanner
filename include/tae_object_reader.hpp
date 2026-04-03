@@ -190,6 +190,12 @@ public:
     // Returns pointer to 64-byte zone map, or nullptr if unavailable
     const uint8_t *GetZoneMap(uint32_t block_idx, uint16_t seqnum) const;
 
+    // Read coalescing: set maximum gap (bytes) between extents that will be
+    // merged into a single read. Default 256 KB — good for S3 where each
+    // request has ~50-100ms latency. Set to 0 to disable coalescing.
+    void SetCoalesceGap(uint32_t gap) { coalesce_gap_ = gap; }
+    uint32_t GetCoalesceGap() const { return coalesce_gap_; }
+
 private:
     std::vector<uint8_t> ReadBytes(uint64_t offset, uint64_t length);
     static std::vector<uint8_t> DecompressLZ4(const uint8_t *src, uint32_t src_len,
@@ -206,6 +212,8 @@ private:
     ObjectMeta                              meta_;
     // Raw metadata buffer kept alive for zone map pointers
     std::vector<uint8_t>                    meta_buf_;
+    // Read coalescing gap: merge reads within this many bytes (default 256 KB)
+    uint32_t                                coalesce_gap_ = 256 * 1024;
 };
 
 } // namespace tae

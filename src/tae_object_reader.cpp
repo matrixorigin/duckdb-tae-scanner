@@ -6,6 +6,7 @@
 
 #include "tae_object_reader.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 
@@ -315,6 +316,10 @@ DecodedColumn TAEObjectReader::DecodeVector(const uint8_t *buf, uint32_t len) {
 
 // ---------------------------------------------------------------------------
 // ReadBlock — read requested columns from a specific block
+//
+// Uses read coalescing: sorts column extents by file offset, merges nearby
+// reads (gap ≤ coalesce_gap_), issues fewer large reads, then slices out
+// individual column data. This dramatically reduces S3 round-trips.
 // ---------------------------------------------------------------------------
 
 std::vector<DecodedColumn> TAEObjectReader::ReadBlock(
@@ -325,20 +330,77 @@ std::vector<DecodedColumn> TAEObjectReader::ReadBlock(
     }
     const auto &blk = meta_.blocks[block_idx];
 
-    std::vector<DecodedColumn> result;
-    result.reserve(seqnums.size());
+    // Build a list of read requests sorted by file offset
+    struct ReadReq {
+        uint16_t seq;          // original seqnum
+        uint32_t result_idx;   // position in output vector
+        uint64_t offset;
+        uint32_t length;
+    };
+    std::vector<ReadReq> reqs;
+    reqs.reserve(seqnums.size());
 
-    for (uint16_t seq : seqnums) {
+    for (uint32_t i = 0; i < seqnums.size(); i++) {
+        uint16_t seq = seqnums[i];
         if (seq >= blk.columns.size()) {
             throw std::runtime_error("column seqnum " + std::to_string(seq) +
                                      " out of range (block has " +
                                      std::to_string(blk.columns.size()) + " columns)");
         }
-        const auto &cm = blk.columns[seq];
-        const Extent &ext = cm.location;
+        const Extent &ext = blk.columns[seq].location;
+        reqs.push_back({seq, i, ext.offset, ext.length});
+    }
 
-        // Read compressed column data from file
-        auto raw = ReadBytes(ext.offset, ext.length);
+    // Sort by file offset for coalescing
+    std::sort(reqs.begin(), reqs.end(),
+              [](const ReadReq &a, const ReadReq &b) { return a.offset < b.offset; });
+
+    // Coalesce adjacent/overlapping reads within gap threshold
+    struct CoalescedRead {
+        uint64_t offset;
+        uint32_t length;
+        std::vector<uint8_t> data; // filled after read
+    };
+    std::vector<CoalescedRead> coalesced;
+    // Map each req index (in sorted order) to its coalesced read index
+    std::vector<uint32_t> req_to_coalesced(reqs.size());
+
+    for (uint32_t i = 0; i < reqs.size(); i++) {
+        uint64_t req_end = reqs[i].offset + reqs[i].length;
+        if (!coalesced.empty()) {
+            auto &last = coalesced.back();
+            uint64_t last_end = last.offset + last.length;
+            uint64_t gap = (reqs[i].offset > last_end) ? (reqs[i].offset - last_end) : 0;
+            if (gap <= coalesce_gap_) {
+                // Extend the coalesced read to cover this request
+                if (req_end > last.offset + last.length) {
+                    last.length = static_cast<uint32_t>(req_end - last.offset);
+                }
+                req_to_coalesced[i] = static_cast<uint32_t>(coalesced.size() - 1);
+                continue;
+            }
+        }
+        req_to_coalesced[i] = static_cast<uint32_t>(coalesced.size());
+        coalesced.push_back({reqs[i].offset, reqs[i].length, {}});
+    }
+
+    // Issue coalesced reads
+    for (auto &cr : coalesced) {
+        cr.data = ReadBytes(cr.offset, cr.length);
+    }
+
+    // Slice out individual columns and decode
+    std::vector<DecodedColumn> result(seqnums.size());
+
+    for (uint32_t i = 0; i < reqs.size(); i++) {
+        const auto &req = reqs[i];
+        const auto &cr = coalesced[req_to_coalesced[i]];
+        const Extent &ext = blk.columns[req.seq].location;
+
+        // Extract this column's bytes from the coalesced buffer
+        uint64_t local_off = req.offset - cr.offset;
+        const uint8_t *raw = cr.data.data() + local_off;
+        uint32_t raw_len = ext.length;
 
         // Decompress if needed
         std::vector<uint8_t> decompressed;
@@ -346,12 +408,12 @@ std::vector<DecodedColumn> TAEObjectReader::ReadBlock(
         uint32_t col_len;
 
         if (ext.is_compressed()) {
-            decompressed = DecompressLZ4(raw.data(), ext.length, ext.origin_size);
+            decompressed = DecompressLZ4(raw, raw_len, ext.origin_size);
             col_data = decompressed.data();
             col_len = ext.origin_size;
         } else {
-            col_data = raw.data();
-            col_len = ext.length;
+            col_data = raw;
+            col_len = raw_len;
         }
 
         // Strip IOEntryHeader (4 bytes)
@@ -365,9 +427,8 @@ std::vector<DecodedColumn> TAEObjectReader::ReadBlock(
         }
 
         // Decode vector binary format
-        auto decoded = DecodeVector(col_data + IO_ENTRY_HEADER_LEN,
-                                    col_len - IO_ENTRY_HEADER_LEN);
-        result.push_back(std::move(decoded));
+        result[req.result_idx] = DecodeVector(col_data + IO_ENTRY_HEADER_LEN,
+                                               col_len - IO_ENTRY_HEADER_LEN);
     }
 
     return result;

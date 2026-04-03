@@ -183,9 +183,50 @@ TEST_CASE("Reader: zone map access", "[reader]") {
     // Zone map should exist for int32 column
     if (zm) {
         ZoneMap z(zm);
-        // The int32 column has values 1..8
-        // Zone map min should be 1, max should be 8
         REQUIRE(z.GetMin<int32_t>() == 10);
         REQUIRE(z.GetMax<int32_t>() == 80);
     }
+}
+
+// ===================================================================
+// Read coalescing
+// ===================================================================
+
+TEST_CASE("Reader: coalescing produces same results as non-coalesced", "[reader][coalesce]") {
+    duckdb::LocalFileSystem fs;
+
+    // Read with coalescing disabled (gap=0 → one read per column)
+    TAEObjectReader reader1(fs, DataPath("basic_3col.tae"));
+    reader1.SetCoalesceGap(0);
+    reader1.ReadMeta();
+    auto cols1 = reader1.ReadBlock(0, {0, 1, 2});
+
+    // Read with coalescing enabled (default 256 KB gap)
+    TAEObjectReader reader2(fs, DataPath("basic_3col.tae"));
+    reader2.ReadMeta();
+    auto cols2 = reader2.ReadBlock(0, {0, 1, 2});
+
+    REQUIRE(cols1.size() == cols2.size());
+    for (size_t i = 0; i < cols1.size(); i++) {
+        REQUIRE(cols1[i].type.oid == cols2[i].type.oid);
+        REQUIRE(cols1[i].row_count == cols2[i].row_count);
+        REQUIRE(cols1[i].data == cols2[i].data);
+        REQUIRE(cols1[i].area == cols2[i].area);
+        REQUIRE(cols1[i].null_bitmap == cols2[i].null_bitmap);
+        REQUIRE(cols1[i].null_count == cols2[i].null_count);
+    }
+}
+
+TEST_CASE("Reader: coalescing works with reversed seqnum order", "[reader][coalesce]") {
+    duckdb::LocalFileSystem fs;
+    TAEObjectReader reader(fs, DataPath("basic_3col.tae"));
+    reader.ReadMeta();
+
+    // Request columns in reverse order — coalescing sorts by offset internally
+    // but must return results in the original requested order
+    auto cols = reader.ReadBlock(0, {2, 0, 1});
+    REQUIRE(cols.size() == 3);
+    REQUIRE(cols[0].type.oid == MO_T_float64); // seqnum 2 = float64
+    REQUIRE(cols[1].type.oid == MO_T_int32);   // seqnum 0 = int32
+    REQUIRE(cols[2].type.oid == MO_T_varchar);  // seqnum 1 = varchar
 }
