@@ -1,0 +1,22 @@
+# Build
+build/
+cmake-build-*/
+compile_commands.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Binaries
+*.so
+*.dylib
+*.dll
+*.o
+*.a
