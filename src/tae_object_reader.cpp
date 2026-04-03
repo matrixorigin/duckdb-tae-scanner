@@ -1,4 +1,4 @@
-// Copyright 2024 Matrix Origin
+// Copyright 2026 Matrix Origin
 // SPDX-License-Identifier: Apache-2.0
 //
 // TAE object file reader implementation.

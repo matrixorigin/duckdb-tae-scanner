@@ -20,3 +20,4 @@ Thumbs.db
 *.dll
 *.o
 *.a
+__pycache__/

@@ -77,5 +77,13 @@ set_target_properties(tae_scanner PROPERTIES
     OUTPUT_NAME "tae_scanner"
 )
 
+# ---------------------------------------------------------------------------
+# Tests (opt-in via BUILD_TESTS or when top-level project)
+# ---------------------------------------------------------------------------
+option(BUILD_TESTS "Build Catch2 unit tests" ON)
+if(BUILD_TESTS)
+    add_subdirectory(test)
+endif()
+
 # Install
 install(TARGETS tae_scanner LIBRARY DESTINATION lib)
