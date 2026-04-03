@@ -644,3 +644,71 @@ TEST_CASE("Scan: project subset of extended types", "[types]") {
     CHECK(result->GetValue(0, 5).ToString() == "01234567-89ab-cdef-0123-456789abcdef");
     CHECK(result->GetValue(1, 5) == Value::INTEGER(6));
 }
+
+// ===================================================================
+// LZ4-compressed data
+// ===================================================================
+
+TEST_CASE("Scan: LZ4-compressed columns read correctly", "[lz4]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT * FROM tae_scan('" +
+                              ManifestPath("manifest_lz4.json") +
+                              "') ORDER BY col_int");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 8);
+    REQUIRE(result->ColumnCount() == 3);
+
+    // Same data as basic_3col: int32 [10..80], varchar, float64
+    CHECK(result->GetValue(0, 0) == Value::INTEGER(10));
+    CHECK(result->GetValue(0, 7) == Value::INTEGER(80));
+    CHECK(result->GetValue(1, 0).ToString() == "alpha");
+    CHECK(result->GetValue(1, 7).ToString() == "theta");
+    CHECK(result->GetValue(2, 0) == Value::DOUBLE(1.1));
+    CHECK(result->GetValue(2, 7) == Value::DOUBLE(8.8));
+}
+
+TEST_CASE("Scan: LZ4-compressed with filter pushdown", "[lz4][filter]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT col_int, col_str FROM tae_scan('" +
+                              ManifestPath("manifest_lz4.json") +
+                              "') WHERE col_int > 50 ORDER BY col_int");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 3);  // 60, 70, 80
+    CHECK(result->GetValue(0, 0) == Value::INTEGER(60));
+    CHECK(result->GetValue(0, 1) == Value::INTEGER(70));
+    CHECK(result->GetValue(0, 2) == Value::INTEGER(80));
+    CHECK(result->GetValue(1, 0).ToString() == "zeta");
+    CHECK(result->GetValue(1, 1).ToString() == "eta");
+    CHECK(result->GetValue(1, 2).ToString() == "theta");
+}
+
+TEST_CASE("Scan: LZ4-compressed with string filter", "[lz4][filter]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT col_int, col_str FROM tae_scan('" +
+                              ManifestPath("manifest_lz4.json") +
+                              "') WHERE col_str = 'gamma'");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 1);
+    CHECK(result->GetValue(0, 0) == Value::INTEGER(30));
+    CHECK(result->GetValue(1, 0).ToString() == "gamma");
+}
+
+TEST_CASE("Scan: LZ4-compressed projection subset", "[lz4]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT col_dbl FROM tae_scan('" +
+                              ManifestPath("manifest_lz4.json") +
+                              "') ORDER BY col_dbl");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 8);
+    REQUIRE(result->ColumnCount() == 1);
+    CHECK(result->GetValue(0, 0) == Value::DOUBLE(1.1));
+    CHECK(result->GetValue(0, 4) == Value::DOUBLE(5.5));
+}
+
+TEST_CASE("Scan: LZ4-compressed EXPLAIN works", "[lz4]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "EXPLAIN SELECT * FROM tae_scan('" +
+                              ManifestPath("manifest_lz4.json") + "')");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() > 0);
+}

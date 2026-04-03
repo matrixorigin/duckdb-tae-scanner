@@ -5,6 +5,7 @@
 
 #include "catch.hpp"
 #include "tae_object_reader.hpp"
+#include "tae_zonemap.hpp"
 
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/local_file_system.hpp"
@@ -257,4 +258,44 @@ TEST_CASE("Reader: prefetch disabled still works", "[reader][prefetch]") {
     auto *vals = reinterpret_cast<const int32_t *>(cols[0].data.data());
     REQUIRE(vals[0] == 10);
     REQUIRE(vals[7] == 80);
+}
+
+// ===================================================================
+// LZ4-compressed data
+// ===================================================================
+
+TEST_CASE("Reader: LZ4-compressed columns decompress correctly", "[reader][lz4]") {
+    duckdb::LocalFileSystem fs;
+    TAEObjectReader reader(fs, DataPath("lz4_3col.tae"));
+    reader.ReadMeta();
+
+    REQUIRE(reader.BlockCount() == 1);
+    auto cols = reader.ReadBlock(0, {0, 1, 2});
+    REQUIRE(cols.size() == 3);
+    REQUIRE(cols[0].row_count == 8);
+
+    // int32 column: [10, 20, 30, 40, 50, 60, 70, 80]
+    auto *ints = reinterpret_cast<const int32_t *>(cols[0].data.data());
+    CHECK(ints[0] == 10);
+    CHECK(ints[3] == 40);
+    CHECK(ints[7] == 80);
+
+    // float64 column: [1.1 .. 8.8]
+    auto *dbls = reinterpret_cast<const double *>(cols[2].data.data());
+    CHECK(dbls[0] == Approx(1.1));
+    CHECK(dbls[7] == Approx(8.8));
+}
+
+TEST_CASE("Reader: LZ4-compressed zone maps still readable", "[reader][lz4]") {
+    duckdb::LocalFileSystem fs;
+    TAEObjectReader reader(fs, DataPath("lz4_3col.tae"));
+    reader.ReadMeta();
+
+    // Zone map for int32 column (seqnum 0): min=10, max=80
+    const uint8_t *zm = reader.GetZoneMap(0, 0);
+    REQUIRE(zm != nullptr);
+    ZoneMap zonemap(zm);
+    CHECK(zonemap.IsInited());
+    CHECK(zonemap.GetMin<int32_t>() == 10);
+    CHECK(zonemap.GetMax<int32_t>() == 80);
 }

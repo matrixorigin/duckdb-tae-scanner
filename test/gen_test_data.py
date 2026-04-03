@@ -20,6 +20,8 @@ import os
 import struct
 import sys
 
+import lz4.block
+
 # --------------------------------------------------------------------------
 # Constants — must match tae_object_reader.hpp exactly
 # --------------------------------------------------------------------------
@@ -395,32 +397,52 @@ class TAEFileBuilder:
     def add_block(self, block_spec):
         self.blocks.append(block_spec)
 
-    def build(self):
-        """Assemble the complete file and return bytes."""
+    def build(self, compress=False):
+        """Assemble the complete file and return bytes.
+
+        Args:
+            compress: If True, LZ4-compress column data and metadata extents.
+        """
         self.buf = bytearray(HEADER_SIZE)  # placeholder header
 
         # Phase 1: write column data blocks, record extents
         for block in self.blocks:
             for col in block['columns']:
                 col_data = build_col_data_extent(col['vector_bytes'])
-                offset = len(self.buf)
-                length = len(col_data)
-                # No compression for test data
-                extent = pack_extent(0, offset, length, length)
+                origin_size = len(col_data)
+                if compress:
+                    compressed = lz4.block.compress(
+                        bytes(col_data), store_size=False)
+                    offset = len(self.buf)
+                    length = len(compressed)
+                    extent = pack_extent(1, offset, length, origin_size)
+                    self.buf += compressed
+                else:
+                    offset = len(self.buf)
+                    length = origin_size
+                    extent = pack_extent(0, offset, length, length)
+                    self.buf += col_data
                 col['extent'] = extent
-                self.buf += col_data
 
         # Phase 2: build metadata
         meta_bytes = self._build_metadata()
-        meta_offset = len(self.buf)
-        meta_length = len(meta_bytes)
-        self.buf += meta_bytes
+        meta_origin_size = len(meta_bytes)
+        if compress:
+            meta_compressed = lz4.block.compress(
+                bytes(meta_bytes), store_size=False)
+            meta_offset = len(self.buf)
+            meta_length = len(meta_compressed)
+            self.buf += meta_compressed
+            meta_extent = pack_extent(1, meta_offset, meta_length, meta_origin_size)
+        else:
+            meta_offset = len(self.buf)
+            meta_length = meta_origin_size
+            self.buf += meta_bytes
+            meta_extent = pack_extent(0, meta_offset, meta_length, meta_length)
 
         # Phase 3: fill in header
         struct.pack_into('<Q', self.buf, 0, OBJECT_MAGIC)       # magic
         struct.pack_into('<H', self.buf, 8, OBJECT_VERSION)     # version
-        # Meta extent at offset 10 (no compression)
-        meta_extent = pack_extent(0, meta_offset, meta_length, meta_length)
         self.buf[HEADER_META_OFF:HEADER_META_OFF + 13] = meta_extent
 
         return bytes(self.buf)
@@ -810,6 +832,46 @@ def gen_with_types(outdir):
     return path, dec64_vals, dec128_vals, uuid_strs, blob_vals, int_vals
 
 
+def gen_lz4_compressed(outdir):
+    """1 block, 3 columns (int32, varchar, float64), 8 rows, LZ4-compressed.
+
+    Same data as gen_basic_3col but with LZ4 compression on all extents.
+    """
+    int_vals  = [10, 20, 30, 40, 50, 60, 70, 80]
+    str_vals  = ['alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta', 'eta', 'theta']
+    dbl_vals  = [1.1, 2.2, 3.3, 4.4, 5.5, 6.6, 7.7, 8.8]
+
+    builder = TAEFileBuilder()
+    builder.add_block({
+        'rows': 8,
+        'columns': [
+            {
+                'mo_type': MO_T_INT32,
+                'vector_bytes': build_vector(MO_T_INT32, 4, int_vals),
+                'zone_map': build_zone_map_numeric(MO_T_INT32, 10, 80, 4),
+                'ndv': 8,
+            },
+            {
+                'mo_type': MO_T_VARCHAR,
+                'vector_bytes': build_vector(MO_T_VARCHAR, -24, str_vals, is_varchar=True),
+                'zone_map': build_zone_map_string(MO_T_VARCHAR, 'alpha', 'zeta'),
+                'ndv': 8,
+            },
+            {
+                'mo_type': MO_T_FLOAT64,
+                'vector_bytes': build_vector(MO_T_FLOAT64, 8, dbl_vals),
+                'zone_map': build_zone_map_numeric(MO_T_FLOAT64, 1.1, 8.8, 8),
+                'ndv': 8,
+            },
+        ],
+    })
+
+    path = os.path.join(outdir, 'lz4_3col.tae')
+    with open(path, 'wb') as f:
+        f.write(builder.build(compress=True))
+    return path, int_vals, str_vals, dbl_vals
+
+
 def gen_manifest(outdir, files):
     """Generate manifest JSON for the test data."""
     manifest = {
@@ -847,6 +909,7 @@ def main():
     part2_path = gen_basic_3col_part2(outdir)
     const_path = gen_with_constants(outdir)
     types_path, _, _, _, _, _ = gen_with_types(outdir)
+    lz4_path, _, _, _ = gen_lz4_compressed(outdir)
 
     gen_manifest(outdir, [basic_path])
 
@@ -924,6 +987,28 @@ def main():
     with open(types_mf_path, 'w') as f:
         json.dump(types_manifest, f, indent=2)
 
+    # LZ4-compressed manifest: same schema as basic_3col
+    lz4_manifest = {
+        'database': 'test_db',
+        'table': 'test_lz4',
+        'columns': [
+            {'name': 'col_int', 'oid': MO_T_INT32},
+            {'name': 'col_str', 'oid': MO_T_VARCHAR},
+            {'name': 'col_dbl', 'oid': MO_T_FLOAT64},
+        ],
+        'objects': [
+            {
+                'path': os.path.basename(lz4_path),
+                'rows': 8,
+                'blocks': 1,
+                'size': os.path.getsize(lz4_path),
+            },
+        ],
+    }
+    lz4_mf_path = os.path.join(outdir, 'manifest_lz4.json')
+    with open(lz4_mf_path, 'w') as f:
+        json.dump(lz4_manifest, f, indent=2)
+
     print(f'Generated test data in {outdir}/')
     print(f'  {os.path.basename(basic_path)}  ({os.path.getsize(basic_path)} bytes)')
     print(f'  {os.path.basename(part2_path)}  ({os.path.getsize(part2_path)} bytes)')
@@ -931,10 +1016,12 @@ def main():
     print(f'  {os.path.basename(nulls_path)}  ({os.path.getsize(nulls_path)} bytes)')
     print(f'  {os.path.basename(const_path)}  ({os.path.getsize(const_path)} bytes)')
     print(f'  {os.path.basename(types_path)}  ({os.path.getsize(types_path)} bytes)')
+    print(f'  {os.path.basename(lz4_path)}  ({os.path.getsize(lz4_path)} bytes, LZ4)')
     print(f'  manifest.json')
     print(f'  manifest_multifile.json')
     print(f'  manifest_constants.json')
     print(f'  manifest_types.json')
+    print(f'  manifest_lz4.json')
 
 
 if __name__ == '__main__':
