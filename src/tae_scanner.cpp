@@ -321,6 +321,141 @@ static bool BlockPassesFilters(const std::vector<PushedFilter> &filters,
 }
 
 // ===================================================================
+// Per-row filter evaluation (applied after zone map block skip)
+// ===================================================================
+
+// Compare a fixed-width value at row_ptr against constant using the given op.
+template <typename T>
+static bool CompareFixed(FilterOp op, const uint8_t *row_ptr, const uint8_t *const_ptr) {
+    T row_val, const_val;
+    memcpy(&row_val, row_ptr, sizeof(T));
+    memcpy(&const_val, const_ptr, sizeof(T));
+    switch (op) {
+    case FilterOp::EQUAL:                  return row_val == const_val;
+    case FilterOp::NOT_EQUAL:              return row_val != const_val;
+    case FilterOp::GREATER_THAN:           return row_val > const_val;
+    case FilterOp::GREATER_THAN_OR_EQUAL:  return row_val >= const_val;
+    case FilterOp::LESS_THAN:              return row_val < const_val;
+    case FilterOp::LESS_THAN_OR_EQUAL:     return row_val <= const_val;
+    default: return true;
+    }
+}
+
+// Check if a single row passes a single filter, using the decoded column data.
+static bool RowPassesFilter(const PushedFilter &pf, const DecodedColumn &col,
+                             duckdb::idx_t row) {
+    // Check nulls
+    bool is_null = false;
+    if (!col.null_bitmap.empty() && row < col.row_count) {
+        uint64_t word = col.null_bitmap[row / 64];
+        is_null = (word & (1ULL << (row % 64))) != 0;
+    }
+
+    if (pf.op == FilterOp::IS_NULL) return is_null;
+    if (pf.op == FilterOp::IS_NOT_NULL) return !is_null;
+    if (is_null) return false; // NULL compared to anything is false
+
+    if (IsStringType(pf.mo_type_oid)) {
+        // Get the string for this row from varlena
+        auto *slots = reinterpret_cast<const Varlena *>(col.data.data());
+        const Varlena &v = slots[row];
+        const char *str;
+        uint32_t str_len;
+        std::string big_str; // keep alive for big varlena
+        if (v.is_inline()) {
+            str = v.inline_data();
+            str_len = v.inline_length();
+        } else {
+            uint32_t off = v.big_offset();
+            str_len = v.big_length();
+            if (off + str_len <= col.area.size()) {
+                str = reinterpret_cast<const char *>(col.area.data() + off);
+            } else {
+                return true; // can't read → assume pass
+            }
+        }
+        // Compare
+        const char *const_str = reinterpret_cast<const char *>(pf.constant.data());
+        int cmp = memcmp(str, const_str, std::min(str_len, pf.const_len));
+        if (cmp == 0 && str_len != pf.const_len) {
+            cmp = (str_len < pf.const_len) ? -1 : 1;
+        }
+        switch (pf.op) {
+        case FilterOp::EQUAL:                  return cmp == 0;
+        case FilterOp::NOT_EQUAL:              return cmp != 0;
+        case FilterOp::GREATER_THAN:           return cmp > 0;
+        case FilterOp::GREATER_THAN_OR_EQUAL:  return cmp >= 0;
+        case FilterOp::LESS_THAN:              return cmp < 0;
+        case FilterOp::LESS_THAN_OR_EQUAL:     return cmp <= 0;
+        default: return true;
+        }
+    }
+
+    // Fixed-width: get pointer to row's value
+    auto elem_size = MOTypeFixedSize(static_cast<MOTypeOid>(pf.mo_type_oid));
+    if (elem_size <= 0) return true;
+    const uint8_t *row_ptr = col.data.data() + row * static_cast<size_t>(elem_size);
+    const uint8_t *const_ptr = pf.constant.data();
+
+    switch (static_cast<MOTypeOid>(pf.mo_type_oid)) {
+    case MO_T_int8:      return CompareFixed<int8_t>(pf.op, row_ptr, const_ptr);
+    case MO_T_int16:     return CompareFixed<int16_t>(pf.op, row_ptr, const_ptr);
+    case MO_T_int32:
+    case MO_T_date:      return CompareFixed<int32_t>(pf.op, row_ptr, const_ptr);
+    case MO_T_int64:
+    case MO_T_datetime:
+    case MO_T_timestamp: return CompareFixed<int64_t>(pf.op, row_ptr, const_ptr);
+    case MO_T_uint8:     return CompareFixed<uint8_t>(pf.op, row_ptr, const_ptr);
+    case MO_T_uint16:    return CompareFixed<uint16_t>(pf.op, row_ptr, const_ptr);
+    case MO_T_uint32:    return CompareFixed<uint32_t>(pf.op, row_ptr, const_ptr);
+    case MO_T_uint64:    return CompareFixed<uint64_t>(pf.op, row_ptr, const_ptr);
+    case MO_T_float32:   return CompareFixed<float>(pf.op, row_ptr, const_ptr);
+    case MO_T_float64:   return CompareFixed<double>(pf.op, row_ptr, const_ptr);
+    case MO_T_bool:      return CompareFixed<uint8_t>(pf.op, row_ptr, const_ptr);
+    default: return true;
+    }
+}
+
+// Apply all pushed filters to the output chunk, compacting rows that pass.
+// decoded_cols: raw decoded data (indexed by projection position, matching output columns).
+// Returns new row count after filtering.
+static duckdb::idx_t ApplyRowFilters(const std::vector<PushedFilter> &filters,
+                                      const std::vector<DecodedColumn> &decoded_cols,
+                                      duckdb::DataChunk &output,
+                                      duckdb::idx_t row_count) {
+    if (filters.empty()) return row_count;
+
+    // Build selection vector of passing rows
+    duckdb::SelectionVector sel(row_count);
+    duckdb::idx_t pass_count = 0;
+
+    for (duckdb::idx_t row = 0; row < row_count; row++) {
+        bool pass = true;
+        for (auto &pf : filters) {
+            // pf.col_idx is the projection index (output column index)
+            if (pf.col_idx >= decoded_cols.size()) continue;
+            if (!RowPassesFilter(pf, decoded_cols[pf.col_idx], row)) {
+                pass = false;
+                break;
+            }
+        }
+        if (pass) {
+            sel.set_index(pass_count++, row);
+        }
+    }
+
+    if (pass_count == row_count) return row_count; // no rows filtered
+    if (pass_count == 0) {
+        output.SetCardinality(0);
+        return 0;
+    }
+
+    // Compact using selection vector
+    output.Slice(sel, pass_count);
+    return pass_count;
+}
+
+// ===================================================================
 // Manifest JSON parsing
 // ===================================================================
 
@@ -499,6 +634,11 @@ static void TAEScanExecute(duckdb::ClientContext &context,
             for (duckdb::idx_t i = 0; i < decoded_cols.size(); i++) {
                 FillColumn(output.data[i], decoded_cols[i], row_count);
             }
+
+            // Apply per-row filtering (zone maps only do block-level skip)
+            duckdb::idx_t filtered_count = ApplyRowFilters(
+                state.filters, decoded_cols, output, row_count);
+            if (filtered_count == 0) continue; // all rows filtered out
             return; // one block per call
         }
 

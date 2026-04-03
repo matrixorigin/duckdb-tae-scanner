@@ -541,6 +541,43 @@ def gen_with_nulls(outdir):
     return path
 
 
+def gen_basic_3col_part2(outdir):
+    """Second 3-column file for multi-file testing: different data, same schema."""
+    int_vals  = [100, 200, 300, 400]
+    str_vals  = ['one', 'two', 'three', 'four']
+    dbl_vals  = [10.1, 20.2, 30.3, 40.4]
+
+    builder = TAEFileBuilder()
+    builder.add_block({
+        'rows': 4,
+        'columns': [
+            {
+                'mo_type': MO_T_INT32,
+                'vector_bytes': build_vector(MO_T_INT32, 4, int_vals),
+                'zone_map': build_zone_map_numeric(MO_T_INT32, 100, 400, 4),
+                'ndv': 4,
+            },
+            {
+                'mo_type': MO_T_VARCHAR,
+                'vector_bytes': build_vector(MO_T_VARCHAR, -24, str_vals, is_varchar=True),
+                'zone_map': build_zone_map_string(MO_T_VARCHAR, 'four', 'two'),
+                'ndv': 4,
+            },
+            {
+                'mo_type': MO_T_FLOAT64,
+                'vector_bytes': build_vector(MO_T_FLOAT64, 8, dbl_vals),
+                'zone_map': build_zone_map_numeric(MO_T_FLOAT64, 10.1, 40.4, 8),
+                'ndv': 4,
+            },
+        ],
+    })
+
+    path = os.path.join(outdir, 'basic_3col_part2.tae')
+    with open(path, 'wb') as f:
+        f.write(builder.build())
+    return path
+
+
 def gen_manifest(outdir, files):
     """Generate manifest JSON for the test data."""
     manifest = {
@@ -575,14 +612,45 @@ def main():
     basic_path, _, _, _ = gen_basic_3col(outdir)
     multi_path = gen_multi_block(outdir)
     nulls_path = gen_with_nulls(outdir)
+    part2_path = gen_basic_3col_part2(outdir)
 
     gen_manifest(outdir, [basic_path])
 
+    # Multi-file manifest: two .tae files with same 3-column schema
+    multifile_manifest = {
+        'database': 'test_db',
+        'table': 'test_multifile',
+        'columns': [
+            {'name': 'col_int', 'oid': MO_T_INT32},
+            {'name': 'col_str', 'oid': MO_T_VARCHAR},
+            {'name': 'col_dbl', 'oid': MO_T_FLOAT64},
+        ],
+        'objects': [
+            {
+                'path': os.path.basename(basic_path),
+                'rows': 8,
+                'blocks': 1,
+                'size': os.path.getsize(basic_path),
+            },
+            {
+                'path': os.path.basename(part2_path),
+                'rows': 4,
+                'blocks': 1,
+                'size': os.path.getsize(part2_path),
+            },
+        ],
+    }
+    mf_path = os.path.join(outdir, 'manifest_multifile.json')
+    with open(mf_path, 'w') as f:
+        json.dump(multifile_manifest, f, indent=2)
+
     print(f'Generated test data in {outdir}/')
     print(f'  {os.path.basename(basic_path)}  ({os.path.getsize(basic_path)} bytes)')
+    print(f'  {os.path.basename(part2_path)}  ({os.path.getsize(part2_path)} bytes)')
     print(f'  {os.path.basename(multi_path)}  ({os.path.getsize(multi_path)} bytes)')
     print(f'  {os.path.basename(nulls_path)}  ({os.path.getsize(nulls_path)} bytes)')
     print(f'  manifest.json')
+    print(f'  manifest_multifile.json')
 
 
 if __name__ == '__main__':

@@ -103,6 +103,51 @@ TEST_CASE("Scan: multi_block reads across blocks", "[scan]") {
 }
 
 // ===================================================================
+// Multi-file (multiple .tae objects in one manifest)
+// ===================================================================
+
+TEST_CASE("Scan: multi-file reads across TAE objects", "[scan][multifile]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT col_int, col_str, col_dbl FROM tae_scan('" +
+                              ManifestPath("manifest_multifile.json") + "') ORDER BY col_int");
+    REQUIRE_FALSE(result->HasError());
+    // 8 rows from basic_3col.tae + 4 rows from basic_3col_part2.tae = 12
+    REQUIRE(result->RowCount() == 12);
+    REQUIRE(result->ColumnCount() == 3);
+
+    // First file rows (sorted): 10..80
+    REQUIRE(result->GetValue(0, 0) == Value::INTEGER(10));
+    REQUIRE(result->GetValue(1, 0) == Value("alpha"));
+
+    // Last rows (from second file): 100..400
+    REQUIRE(result->GetValue(0, 8) == Value::INTEGER(100));
+    REQUIRE(result->GetValue(1, 8) == Value("one"));
+    REQUIRE(result->GetValue(0, 11) == Value::INTEGER(400));
+    REQUIRE(result->GetValue(1, 11) == Value("four"));
+}
+
+TEST_CASE("Scan: multi-file COUNT(*)", "[scan][multifile]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT COUNT(*) FROM tae_scan('" +
+                              ManifestPath("manifest_multifile.json") + "')");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->GetValue(0, 0) == Value::BIGINT(12));
+}
+
+TEST_CASE("Scan: multi-file filter crosses file boundary", "[scan][multifile]") {
+    auto db = MakeDB();
+    // Filter that spans both files: col_int > 50
+    // File 1: 60,70,80 match. File 2: 100,200,300,400 match. Total 7 rows.
+    auto result = Query(*db, "SELECT col_int FROM tae_scan('" +
+                              ManifestPath("manifest_multifile.json") +
+                              "') WHERE col_int > 50 ORDER BY col_int");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 7);
+    REQUIRE(result->GetValue(0, 0) == Value::INTEGER(60));
+    REQUIRE(result->GetValue(0, 6) == Value::INTEGER(400));
+}
+
+// ===================================================================
 // Null handling
 // ===================================================================
 

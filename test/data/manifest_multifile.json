@@ -1,0 +1,32 @@
+{
+  "database": "test_db",
+  "table": "test_multifile",
+  "columns": [
+    {
+      "name": "col_int",
+      "oid": 22
+    },
+    {
+      "name": "col_str",
+      "oid": 61
+    },
+    {
+      "name": "col_dbl",
+      "oid": 31
+    }
+  ],
+  "objects": [
+    {
+      "path": "basic_3col.tae",
+      "rows": 8,
+      "blocks": 1,
+      "size": 1616
+    },
+    {
+      "path": "basic_3col_part2.tae",
+      "rows": 4,
+      "blocks": 1,
+      "size": 1472
+    }
+  ]
+}
