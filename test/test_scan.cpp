@@ -291,3 +291,45 @@ TEST_CASE("Scan: EXPLAIN ANALYZE shows runtime stats", "[scan][explain]") {
     REQUIRE(text.find("Blocks Scanned") != std::string::npos);
     REQUIRE(text.find("Rows Emitted") != std::string::npos);
 }
+
+// ===================================================================
+// Parallel scanning correctness
+// ===================================================================
+
+TEST_CASE("Scan: parallel scan returns correct results for multi-block", "[scan][parallel]") {
+    auto db = MakeDB();
+    // multi_block has 2 blocks: block0=[1,2,3,4], block1=[100,200,300,400]
+    // With parallelism, blocks may be scanned in any order; ORDER BY ensures determinism
+    auto result = Query(*db, "SELECT col_int FROM tae_scan('" +
+                              ManifestPath("manifest_multi.json") +
+                              "') ORDER BY col_int");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 8);
+    REQUIRE(result->GetValue(0, 0) == Value::INTEGER(1));
+    REQUIRE(result->GetValue(0, 3) == Value::INTEGER(4));
+    REQUIRE(result->GetValue(0, 4) == Value::INTEGER(100));
+    REQUIRE(result->GetValue(0, 7) == Value::INTEGER(400));
+}
+
+TEST_CASE("Scan: parallel scan correctness with multi-file", "[scan][parallel]") {
+    auto db = MakeDB();
+    // 2 objects (8+4 rows), blocks may be scanned in parallel
+    auto result = Query(*db, "SELECT col_int FROM tae_scan('" +
+                              ManifestPath("manifest_multifile.json") +
+                              "') ORDER BY col_int");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 12);
+    REQUIRE(result->GetValue(0, 0) == Value::INTEGER(10));
+    REQUIRE(result->GetValue(0, 11) == Value::INTEGER(400));
+}
+
+TEST_CASE("Scan: parallel scan with filter returns correct subset", "[scan][parallel]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT col_int FROM tae_scan('" +
+                              ManifestPath("manifest_multifile.json") +
+                              "') WHERE col_int >= 100 ORDER BY col_int");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 4);
+    REQUIRE(result->GetValue(0, 0) == Value::INTEGER(100));
+    REQUIRE(result->GetValue(0, 3) == Value::INTEGER(400));
+}

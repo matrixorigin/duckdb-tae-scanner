@@ -14,7 +14,9 @@
 #include "duckdb.hpp"
 #include "tae_object_reader.hpp"
 #include "tae_zonemap.hpp"
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -44,6 +46,14 @@ struct PushedFilter {
 };
 
 // ---------------------------------------------------------------------------
+// Work unit: one block within one object
+// ---------------------------------------------------------------------------
+struct WorkUnit {
+    uint32_t object_idx;
+    uint32_t block_idx;
+};
+
+// ---------------------------------------------------------------------------
 // Bind data — schema + object list, computed once per query (const after bind)
 // ---------------------------------------------------------------------------
 struct TAEScanBindData : public duckdb::TableFunctionData {
@@ -63,7 +73,7 @@ struct TAEScanBindData : public duckdb::TableFunctionData {
 };
 
 // ---------------------------------------------------------------------------
-// Init state — per-thread scan state (mutable during scan)
+// Global state — shared work dispatcher (thread-safe)
 // ---------------------------------------------------------------------------
 struct TAEScanState : public duckdb::GlobalTableFunctionState {
     // Projection: which columns the query actually needs
@@ -73,23 +83,28 @@ struct TAEScanState : public duckdb::GlobalTableFunctionState {
     // Pushed-down filters (populated from DuckDB TableFilterSet)
     std::vector<PushedFilter>      filters;
 
-    // Current position
-    duckdb::idx_t current_object = 0;
-    duckdb::idx_t current_block  = 0;
+    // Flattened work queue: all (object_idx, block_idx) pairs
+    std::vector<WorkUnit>          work_units;
+    std::atomic<duckdb::idx_t>     next_work_unit{0};
 
-    // Current reader (one per object file)
-    std::unique_ptr<TAEObjectReader> reader;
+    // Statistics / progress (atomics for thread safety)
+    std::atomic<uint64_t>          blocks_scanned{0};
+    std::atomic<uint64_t>          blocks_skipped{0};
+    std::atomic<uint64_t>          rows_emitted{0};
 
-    // Statistics / progress
-    uint64_t blocks_scanned = 0;
-    uint64_t blocks_skipped = 0;
-    uint64_t rows_emitted = 0;
-
-    duckdb::idx_t MaxThreads() const override { return 1; }
+    duckdb::idx_t MaxThreads() const override {
+        return work_units.empty() ? 1 : work_units.size();
+    }
 };
 
-// Minimal local state (single-threaded for now)
-struct TAEScanLocalState : public duckdb::LocalTableFunctionState {};
+// ---------------------------------------------------------------------------
+// Local state — per-thread reader and resources
+// ---------------------------------------------------------------------------
+struct TAEScanLocalState : public duckdb::LocalTableFunctionState {
+    // Per-thread reader (avoids locking on file I/O)
+    std::unique_ptr<TAEObjectReader> reader;
+    uint32_t                         reader_object_idx = UINT32_MAX;
+};
 
 // ---------------------------------------------------------------------------
 // Public API: register the tae_scan table function

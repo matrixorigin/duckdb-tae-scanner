@@ -602,66 +602,95 @@ TAEScanInit(duckdb::ClientContext &context,
         }
     }
 
+    // Build flattened work queue: all (object_idx, block_idx) pairs
+    for (uint32_t obj = 0; obj < bind.objects.size(); obj++) {
+        for (uint32_t blk = 0; blk < bind.objects[obj].blocks; blk++) {
+            state->work_units.push_back({obj, blk});
+        }
+    }
+
     return std::move(state);
 }
 
 // ===================================================================
-// Execute — scan loop with zone map block skipping
+// Init local — per-thread reader and state
+// ===================================================================
+static duckdb::unique_ptr<duckdb::LocalTableFunctionState>
+TAEScanInitLocal(duckdb::ExecutionContext &context,
+                 duckdb::TableFunctionInitInput &input,
+                 duckdb::GlobalTableFunctionState *global_state) {
+    return duckdb::make_uniq<TAEScanLocalState>();
+}
+
+// ===================================================================
+// Execute — parallel scan with atomic work dispatch
 // ===================================================================
 static void TAEScanExecute(duckdb::ClientContext &context,
                             duckdb::TableFunctionInput &input,
                             duckdb::DataChunk &output) {
     auto &bind = input.bind_data->Cast<TAEScanBindData>();
-    auto &state = input.global_state->Cast<TAEScanState>();
+    auto &gstate = input.global_state->Cast<TAEScanState>();
+    auto *lstate = input.local_state
+                       ? &input.local_state->Cast<TAEScanLocalState>()
+                       : nullptr;
 
-    while (state.current_object < bind.objects.size()) {
-        // Open next object if needed
-        if (!state.reader) {
+    while (true) {
+        // Atomically grab next work unit
+        auto wu_idx = gstate.next_work_unit.fetch_add(1);
+        if (wu_idx >= gstate.work_units.size()) {
+            output.SetCardinality(0);
+            return;
+        }
+
+        auto &wu = gstate.work_units[wu_idx];
+
+        // Open reader for this object (reuse if same object)
+        TAEObjectReader *reader = nullptr;
+        std::unique_ptr<TAEObjectReader> temp_reader;
+
+        if (lstate && lstate->reader_object_idx == wu.object_idx) {
+            reader = lstate->reader.get();
+        } else {
             auto &fs = duckdb::FileSystem::GetFileSystem(context);
             auto path = std::filesystem::path(bind.data_dir) /
-                        bind.objects[state.current_object].file_path;
-            state.reader = std::make_unique<TAEObjectReader>(fs, path.string());
-            state.reader->ReadMeta();
-            state.current_block = 0;
+                        bind.objects[wu.object_idx].file_path;
+            auto new_reader = std::make_unique<TAEObjectReader>(fs, path.string());
+            new_reader->ReadMeta();
+            if (lstate) {
+                lstate->reader = std::move(new_reader);
+                lstate->reader_object_idx = wu.object_idx;
+                reader = lstate->reader.get();
+            } else {
+                temp_reader = std::move(new_reader);
+                reader = temp_reader.get();
+            }
         }
 
-        // Find next block that passes zone map filters
-        while (state.current_block < state.reader->BlockCount()) {
-            auto blk = static_cast<uint32_t>(state.current_block);
-            state.current_block++;
-
-            if (!state.filters.empty() &&
-                !BlockPassesFilters(state.filters, *state.reader, blk)) {
-                state.blocks_skipped++;
-                continue;
-            }
-
-            // Read the block
-            state.blocks_scanned++;
-            auto decoded_cols = state.reader->ReadBlock(blk, state.read_seqnums);
-            if (decoded_cols.empty()) continue;
-
-            duckdb::idx_t row_count = decoded_cols[0].row_count;
-            output.SetCardinality(row_count);
-            for (duckdb::idx_t i = 0; i < decoded_cols.size(); i++) {
-                FillColumn(output.data[i], decoded_cols[i], row_count);
-            }
-
-            // Apply per-row filtering (zone maps only do block-level skip)
-            duckdb::idx_t filtered_count = ApplyRowFilters(
-                state.filters, decoded_cols, output, row_count);
-            if (filtered_count == 0) continue; // all rows filtered out
-            state.rows_emitted += filtered_count;
-            return; // one block per call
+        // Zone map filter: skip block if any filter rejects
+        if (!gstate.filters.empty() &&
+            !BlockPassesFilters(gstate.filters, *reader, wu.block_idx)) {
+            gstate.blocks_skipped.fetch_add(1, std::memory_order_relaxed);
+            continue;
         }
 
-        // Exhausted current object → move to next
-        state.current_object++;
-        state.reader.reset();
+        // Read the block
+        gstate.blocks_scanned.fetch_add(1, std::memory_order_relaxed);
+        auto decoded_cols = reader->ReadBlock(wu.block_idx, gstate.read_seqnums);
+        if (decoded_cols.empty()) continue;
+
+        duckdb::idx_t row_count = decoded_cols[0].row_count;
+        output.SetCardinality(row_count);
+        for (duckdb::idx_t i = 0; i < decoded_cols.size(); i++) {
+            FillColumn(output.data[i], decoded_cols[i], row_count);
+        }
+
+        // Apply per-row filtering (zone maps only do block-level skip)
+        duckdb::idx_t filtered_count = ApplyRowFilters(
+            gstate.filters, decoded_cols, output, row_count);
+        if (filtered_count == 0) continue; // all rows filtered out
+        gstate.rows_emitted.fetch_add(filtered_count, std::memory_order_relaxed);
+        return;
     }
-
-    // No more data
-    output.SetCardinality(0);
 }
 
 // ===================================================================
@@ -822,16 +851,6 @@ TAEScanStatistics(duckdb::ClientContext &context,
 }
 
 // ===================================================================
-// Init local — minimal local state (single-threaded for now)
-// ===================================================================
-static duckdb::unique_ptr<duckdb::LocalTableFunctionState>
-TAEScanInitLocal(duckdb::ExecutionContext &context,
-                 duckdb::TableFunctionInitInput &input,
-                 duckdb::GlobalTableFunctionState *global_state) {
-    return duckdb::make_uniq<TAEScanLocalState>();
-}
-
-// ===================================================================
 // Progress — scan completion percentage (0–100)
 // ===================================================================
 static double TAEScanProgress(duckdb::ClientContext &context,
@@ -842,7 +861,9 @@ static double TAEScanProgress(duckdb::ClientContext &context,
     auto &state = global_state->Cast<TAEScanState>();
 
     if (bind.total_blocks == 0) return 100.0;
-    double done = static_cast<double>(state.blocks_scanned + state.blocks_skipped);
+    double done = static_cast<double>(
+        state.blocks_scanned.load(std::memory_order_relaxed) +
+        state.blocks_skipped.load(std::memory_order_relaxed));
     return (done / static_cast<double>(bind.total_blocks)) * 100.0;
 }
 
@@ -874,9 +895,9 @@ TAEScanDynamicToString(duckdb::TableFunctionDynamicToStringInput &input) {
     if (!input.global_state) return result;
     auto &state = input.global_state->Cast<TAEScanState>();
 
-    result["Blocks Scanned"] = std::to_string(state.blocks_scanned);
-    result["Blocks Skipped"] = std::to_string(state.blocks_skipped);
-    result["Rows Emitted"] = std::to_string(state.rows_emitted);
+    result["Blocks Scanned"] = std::to_string(state.blocks_scanned.load(std::memory_order_relaxed));
+    result["Blocks Skipped"] = std::to_string(state.blocks_skipped.load(std::memory_order_relaxed));
+    result["Rows Emitted"] = std::to_string(state.rows_emitted.load(std::memory_order_relaxed));
     return result;
 }
 
@@ -886,7 +907,7 @@ TAEScanDynamicToString(duckdb::TableFunctionDynamicToStringInput &input) {
 static duckdb::idx_t TAEScanRowsScanned(duckdb::GlobalTableFunctionState &global_state,
                                          duckdb::LocalTableFunctionState &local_state) {
     auto &state = global_state.Cast<TAEScanState>();
-    return state.rows_emitted;
+    return state.rows_emitted.load(std::memory_order_relaxed);
 }
 
 // ===================================================================
