@@ -503,8 +503,11 @@ static bool RowPassesFilter(const PushedFilter &pf, const DecodedColumn &col,
     // Check nulls
     bool is_null = false;
     if (!col.null_bitmap.empty() && row < col.row_count) {
-        uint64_t word = col.null_bitmap[row / 64];
-        is_null = (word & (1ULL << (row % 64))) != 0;
+        uint64_t word_idx = row / 64;
+        if (word_idx < col.null_bitmap.size()) {
+            uint64_t word = col.null_bitmap[word_idx];
+            is_null = (word & (1ULL << (row % 64))) != 0;
+        }
     }
 
     if (pf.op == FilterOp::IS_NULL) return is_null;
@@ -517,7 +520,6 @@ static bool RowPassesFilter(const PushedFilter &pf, const DecodedColumn &col,
         const Varlena &v = slots[row];
         const char *str;
         uint32_t str_len;
-        std::string big_str; // keep alive for big varlena
         if (v.is_inline()) {
             str = v.inline_data();
             str_len = v.inline_length();
@@ -898,19 +900,16 @@ static void TAEScanExecute(duckdb::ClientContext &context,
                 break;
             case OutputColumnInfo::VCOL_FILENAME: {
                 auto fname = bind.objects[wu.object_idx].file_path;
-                output.data[i].SetValue(0, duckdb::Value(fname));
+                auto target = duckdb::StringVector::AddString(output.data[i], fname);
                 auto *data = duckdb::FlatVector::GetData<duckdb::string_t>(output.data[i]);
-                for (duckdb::idx_t r = 1; r < row_count; r++) {
-                    data[r] = data[0];
-                }
+                std::fill_n(data, row_count, target);
                 break;
             }
-            case OutputColumnInfo::VCOL_BLOCK_ID:
-                output.data[i].SetValue(0, duckdb::Value::INTEGER(static_cast<int32_t>(wu.block_idx)));
-                for (duckdb::idx_t r = 1; r < row_count; r++) {
-                    output.data[i].SetValue(r, duckdb::Value::INTEGER(static_cast<int32_t>(wu.block_idx)));
-                }
+            case OutputColumnInfo::VCOL_BLOCK_ID: {
+                auto *data = duckdb::FlatVector::GetData<int32_t>(output.data[i]);
+                std::fill_n(data, row_count, static_cast<int32_t>(wu.block_idx));
                 break;
+            }
             }
         }
 
