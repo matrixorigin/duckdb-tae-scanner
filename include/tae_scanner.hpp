@@ -22,6 +22,10 @@
 
 namespace tae {
 
+// Virtual column IDs (must be >= VIRTUAL_COLUMN_START = 2^63)
+static constexpr duckdb::column_t VCOL_FILENAME  = UINT64_C(9223372036854775808); // 2^63
+static constexpr duckdb::column_t VCOL_BLOCK_ID  = UINT64_C(9223372036854775809); // 2^63 + 1
+
 // ---------------------------------------------------------------------------
 // Manifest: list of objects for a table
 // ---------------------------------------------------------------------------
@@ -75,9 +79,19 @@ struct TAEScanBindData : public duckdb::TableFunctionData {
 // ---------------------------------------------------------------------------
 // Global state — shared work dispatcher (thread-safe)
 // ---------------------------------------------------------------------------
+
+// Describes what each output column slot holds
+struct OutputColumnInfo {
+    enum Kind { TAE_COLUMN, VCOL_FILENAME, VCOL_BLOCK_ID };
+    Kind         kind;
+    duckdb::idx_t tae_col_idx; // only valid for TAE_COLUMN
+};
+
 struct TAEScanState : public duckdb::GlobalTableFunctionState {
-    // Projection: which columns the query actually needs
-    std::vector<duckdb::idx_t>     projected_col_indices; // into all_col_*
+    // Per output column: what to fill (TAE column or virtual column)
+    std::vector<OutputColumnInfo>   output_map;
+
+    // TAE column seqnums to read (only for TAE columns in output_map)
     std::vector<uint16_t>          read_seqnums;
 
     // Pushed-down filters (populated from DuckDB TableFilterSet)

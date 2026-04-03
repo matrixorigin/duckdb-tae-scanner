@@ -333,3 +333,70 @@ TEST_CASE("Scan: parallel scan with filter returns correct subset", "[scan][para
     REQUIRE(result->GetValue(0, 0) == Value::INTEGER(100));
     REQUIRE(result->GetValue(0, 3) == Value::INTEGER(400));
 }
+
+// ===================================================================
+// Virtual columns
+// ===================================================================
+
+TEST_CASE("Scan: virtual column file_path returns object filename", "[scan][virtual]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT file_path FROM tae_scan('" +
+                              ManifestPath("manifest.json") + "')");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 8);
+    // All rows should have the same file path
+    auto val = result->GetValue(0, 0).ToString();
+    CHECK(val.find("basic_3col.tae") != std::string::npos);
+    for (idx_t i = 1; i < result->RowCount(); i++) {
+        CHECK(result->GetValue(0, i).ToString() == val);
+    }
+}
+
+TEST_CASE("Scan: virtual column block_id returns block index", "[scan][virtual]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT block_id FROM tae_scan('" +
+                              ManifestPath("manifest_multi.json") + "') ORDER BY block_id");
+    REQUIRE_FALSE(result->HasError());
+    // multi_block.tae has 2 blocks, 4 rows each
+    REQUIRE(result->RowCount() == 8);
+    // First 4 rows should be block 0, next 4 block 1
+    for (idx_t i = 0; i < 4; i++) {
+        CHECK(result->GetValue(0, i) == Value::INTEGER(0));
+    }
+    for (idx_t i = 4; i < 8; i++) {
+        CHECK(result->GetValue(0, i) == Value::INTEGER(1));
+    }
+}
+
+TEST_CASE("Scan: virtual columns mixed with TAE columns", "[scan][virtual]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT col_int, file_path, block_id FROM tae_scan('" +
+                              ManifestPath("manifest.json") + "') ORDER BY col_int");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 8);
+    // Check TAE column values
+    CHECK(result->GetValue(0, 0) == Value::INTEGER(10));
+    CHECK(result->GetValue(0, 7) == Value::INTEGER(80));
+    // file_path for all rows
+    auto fname = result->GetValue(1, 0).ToString();
+    CHECK(fname.find("basic_3col.tae") != std::string::npos);
+    // block_id should be 0 for single-block file
+    for (idx_t i = 0; i < 8; i++) {
+        CHECK(result->GetValue(2, i) == Value::INTEGER(0));
+    }
+}
+
+TEST_CASE("Scan: virtual columns with multi-file show different file paths", "[scan][virtual]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT col_int, file_path FROM tae_scan('" +
+                              ManifestPath("manifest_multifile.json") +
+                              "') ORDER BY col_int");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 12);
+    // Rows from basic_3col.tae (int 10-80) and basic_3col_part2.tae (int 100-400)
+    auto fp_first = result->GetValue(1, 0).ToString();   // int=10 → basic_3col.tae
+    auto fp_last  = result->GetValue(1, 11).ToString();   // int=400 → basic_3col_part2.tae
+    CHECK(fp_first.find("basic_3col.tae") != std::string::npos);
+    CHECK(fp_last.find("basic_3col_part2.tae") != std::string::npos);
+    CHECK(fp_first != fp_last);
+}

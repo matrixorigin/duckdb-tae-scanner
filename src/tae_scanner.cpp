@@ -24,6 +24,8 @@
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/statistics/numeric_stats.hpp"
 #include "duckdb/storage/statistics/string_stats.hpp"
+#include "duckdb/common/constants.hpp"
+#include "duckdb/common/table_column.hpp"
 
 #include <cstring>
 #include <fstream>
@@ -574,11 +576,24 @@ TAEScanInit(duckdb::ClientContext &context,
     auto &bind = input.bind_data->Cast<TAEScanBindData>();
     auto state = duckdb::make_uniq<TAEScanState>();
 
-    // Resolve projected columns → TAE seqnums
+    // Build output_map: classify each requested column as TAE or virtual
+    // Also track projected TAE column indices for filter mapping
+    std::vector<duckdb::idx_t> projected_col_indices;
     for (auto &col_id : input.column_ids) {
-        auto idx = static_cast<duckdb::idx_t>(col_id);
-        state->projected_col_indices.push_back(idx);
-        state->read_seqnums.push_back(static_cast<uint16_t>(idx));
+        auto id = static_cast<duckdb::column_t>(col_id);
+        if (id == VCOL_FILENAME) {
+            state->output_map.push_back({OutputColumnInfo::VCOL_FILENAME, 0});
+        } else if (id == VCOL_BLOCK_ID) {
+            state->output_map.push_back({OutputColumnInfo::VCOL_BLOCK_ID, 0});
+        } else if (duckdb::IsVirtualColumn(id)) {
+            // Unknown virtual column — skip (shouldn't happen)
+            state->output_map.push_back({OutputColumnInfo::VCOL_FILENAME, 0});
+        } else {
+            auto tae_idx = static_cast<duckdb::idx_t>(id);
+            state->output_map.push_back({OutputColumnInfo::TAE_COLUMN, tae_idx});
+            state->read_seqnums.push_back(static_cast<uint16_t>(tae_idx));
+            projected_col_indices.push_back(tae_idx);
+        }
     }
 
     // Extract pushed-down filters from DuckDB's TableFilterSet
@@ -588,8 +603,10 @@ TAEScanInit(duckdb::ClientContext &context,
             auto &filter = entry.Filter();
 
             // Map projection index → table column index
-            if (proj_idx >= state->projected_col_indices.size()) continue;
-            auto table_col = state->projected_col_indices[proj_idx];
+            if (proj_idx >= state->output_map.size()) continue;
+            auto &om = state->output_map[proj_idx];
+            if (om.kind != OutputColumnInfo::TAE_COLUMN) continue;
+            auto table_col = om.tae_col_idx;
             if (table_col >= bind.all_col_mo_oids.size()) continue;
 
             uint8_t mo_oid = bind.all_col_mo_oids[table_col];
@@ -673,15 +690,48 @@ static void TAEScanExecute(duckdb::ClientContext &context,
             continue;
         }
 
-        // Read the block
+        // Read the block (only TAE columns, not virtual)
         gstate.blocks_scanned.fetch_add(1, std::memory_order_relaxed);
         auto decoded_cols = reader->ReadBlock(wu.block_idx, gstate.read_seqnums);
-        if (decoded_cols.empty()) continue;
+        if (decoded_cols.empty() && !gstate.read_seqnums.empty()) continue;
 
-        duckdb::idx_t row_count = decoded_cols[0].row_count;
+        // Determine row count from first decoded TAE column, or from object metadata
+        duckdb::idx_t row_count = 0;
+        if (!decoded_cols.empty()) {
+            row_count = decoded_cols[0].row_count;
+        } else {
+            // All output columns are virtual — use block row count from metadata
+            row_count = reader->BlockRowCount(wu.block_idx);
+        }
         output.SetCardinality(row_count);
-        for (duckdb::idx_t i = 0; i < decoded_cols.size(); i++) {
-            FillColumn(output.data[i], decoded_cols[i], row_count);
+
+        // Fill output columns using output_map
+        duckdb::idx_t tae_col_pos = 0; // index into decoded_cols
+        for (duckdb::idx_t i = 0; i < gstate.output_map.size(); i++) {
+            auto &om = gstate.output_map[i];
+            switch (om.kind) {
+            case OutputColumnInfo::TAE_COLUMN:
+                if (tae_col_pos < decoded_cols.size()) {
+                    FillColumn(output.data[i], decoded_cols[tae_col_pos], row_count);
+                }
+                tae_col_pos++;
+                break;
+            case OutputColumnInfo::VCOL_FILENAME: {
+                auto fname = bind.objects[wu.object_idx].file_path;
+                output.data[i].SetValue(0, duckdb::Value(fname));
+                auto *data = duckdb::FlatVector::GetData<duckdb::string_t>(output.data[i]);
+                for (duckdb::idx_t r = 1; r < row_count; r++) {
+                    data[r] = data[0];
+                }
+                break;
+            }
+            case OutputColumnInfo::VCOL_BLOCK_ID:
+                output.data[i].SetValue(0, duckdb::Value::INTEGER(static_cast<int32_t>(wu.block_idx)));
+                for (duckdb::idx_t r = 1; r < row_count; r++) {
+                    output.data[i].SetValue(r, duckdb::Value::INTEGER(static_cast<int32_t>(wu.block_idx)));
+                }
+                break;
+            }
         }
 
         // Apply per-row filtering (zone maps only do block-level skip)
@@ -911,6 +961,47 @@ static duckdb::idx_t TAEScanRowsScanned(duckdb::GlobalTableFunctionState &global
 }
 
 // ===================================================================
+// GetVirtualColumns — expose file_path and block_id virtual columns
+// ===================================================================
+static duckdb::virtual_column_map_t
+TAEScanGetVirtualColumns(duckdb::ClientContext &context,
+                         duckdb::optional_ptr<duckdb::FunctionData> bind_data) {
+    duckdb::virtual_column_map_t result;
+    result.emplace(VCOL_FILENAME, duckdb::TableColumn("file_path", duckdb::LogicalType::VARCHAR));
+    result.emplace(VCOL_BLOCK_ID, duckdb::TableColumn("block_id", duckdb::LogicalType::INTEGER));
+    return result;
+}
+
+// ===================================================================
+// SupportsPushdownType — which column types support filter pushdown
+// ===================================================================
+static bool TAEScanSupportsPushdownType(const duckdb::FunctionData &bind_data_p,
+                                        duckdb::idx_t col_idx) {
+    auto &bind = bind_data_p.Cast<TAEScanBindData>();
+    if (col_idx >= bind.all_col_types.size()) return false;
+    auto &type = bind.all_col_types[col_idx];
+    switch (type.id()) {
+    case duckdb::LogicalTypeId::TINYINT:
+    case duckdb::LogicalTypeId::SMALLINT:
+    case duckdb::LogicalTypeId::INTEGER:
+    case duckdb::LogicalTypeId::BIGINT:
+    case duckdb::LogicalTypeId::UTINYINT:
+    case duckdb::LogicalTypeId::USMALLINT:
+    case duckdb::LogicalTypeId::UINTEGER:
+    case duckdb::LogicalTypeId::UBIGINT:
+    case duckdb::LogicalTypeId::FLOAT:
+    case duckdb::LogicalTypeId::DOUBLE:
+    case duckdb::LogicalTypeId::BOOLEAN:
+    case duckdb::LogicalTypeId::DATE:
+    case duckdb::LogicalTypeId::TIMESTAMP:
+    case duckdb::LogicalTypeId::VARCHAR:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// ===================================================================
 // GetTAEScanFunction — construct the TableFunction with filter pushdown
 // ===================================================================
 duckdb::TableFunction GetTAEScanFunction() {
@@ -929,6 +1020,8 @@ duckdb::TableFunction GetTAEScanFunction() {
     func.to_string = TAEScanToString;
     func.dynamic_to_string = TAEScanDynamicToString;
     func.rows_scanned = TAEScanRowsScanned;
+    func.get_virtual_columns = TAEScanGetVirtualColumns;
+    func.supports_pushdown_type = TAEScanSupportsPushdownType;
 
     return func;
 }

@@ -185,6 +185,9 @@ public:
     // Accessors
     const ObjectMeta &Meta() const { return meta_; }
     uint32_t BlockCount() const { return meta_.block_count; }
+    uint32_t BlockRowCount(uint32_t block_idx) const {
+        return block_idx < meta_.blocks.size() ? meta_.blocks[block_idx].rows : 0;
+    }
 
     // Zone map access for predicate pushdown
     // Returns pointer to 64-byte zone map, or nullptr if unavailable
