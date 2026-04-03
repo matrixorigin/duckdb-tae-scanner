@@ -1,0 +1,11 @@
+{
+  "database": "test_db",
+  "table": "test_nulls",
+  "columns": [
+    {"name": "col_int", "oid": 22},
+    {"name": "col_str", "oid": 61}
+  ],
+  "objects": [
+    {"path": "with_nulls.tae", "rows": 6, "blocks": 1}
+  ]
+}

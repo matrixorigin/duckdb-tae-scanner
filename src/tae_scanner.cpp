@@ -40,7 +40,7 @@ static void CopyFixedColumn(duckdb::Vector &out_vec,
                              duckdb::idx_t count) {
     auto elem_size = MOTypeFixedSize(static_cast<MOTypeOid>(col.type.oid));
     if (elem_size <= 0) return;
-    auto *dst = duckdb::FlatVector::GetData<uint8_t>(out_vec);
+    auto *dst = duckdb::FlatVector::GetData(out_vec);
     memcpy(dst, col.data.data(), count * static_cast<size_t>(elem_size));
 }
 
