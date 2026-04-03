@@ -488,23 +488,40 @@ WHERE l_shipdate >= DATE '1994-01-01'
 
 #### Phase 2: Init
 
-- Create scan state
-- Optionally set up parallel scan coordination (multi-threaded)
+- Build `output_map` classifying each output column as TAE_COLUMN or virtual
+  (VCOL_FILENAME, VCOL_BLOCK_ID)
+- Extract pushed-down filters and encode constants in MO binary format
+- Read sampling options (`TABLESAMPLE SYSTEM`)
+- Build flattened work queue of `(object_idx, block_idx)` pairs
+- Create per-thread local state (RNG for sampling)
 
-#### Phase 3: Execute (called repeatedly until EOF)
+#### Phase 3: Execute (parallel, called repeatedly until EOF)
 
 ```
-for each object in object_list:
-    reader = TAEObjectReader(data_dir / object.path)
-    reader.ReadMeta()
-    for each block in reader:
-        // Zone map check (predicate pushdown)
-        if zone_map_eliminates(block, predicates):
-            continue  // skip entire block
-        decoded_cols = reader.ReadBlock(block_idx, seqnums)
-        fill_data_chunk(output, decoded_cols)
-        return  // yield one block per Execute() call
-output.SetCardinality(0)  // EOF
+work_unit = work_queue[next_idx.fetch_add(1)]  // atomic dispatch
+reader = open/cache TAEObjectReader for work_unit.object_idx
+reader.ReadMeta()
+
+// Zone map check (block-level skip)
+for each pushed filter:
+    if zone_map_eliminates(block, filter):
+        blocks_skipped++; continue to next work unit
+
+decoded_cols = reader.ReadBlock(block_idx, projected_seqnums)
+
+// Fill output columns via output_map:
+//   TAE_COLUMN  → FillColumn (handles FLAT + CONSTANT vectors)
+//   VCOL_FILENAME → fill_n with file path string
+//   VCOL_BLOCK_ID → fill_n with block index
+
+// Per-row filter evaluation
+filtered_count = ApplyRowFilters(filters, decoded_cols, output)
+
+// Bernoulli sampling (if TABLESAMPLE SYSTEM)
+if do_sample:
+    sample_count = apply_bernoulli(filtered_count, sample_rate, rng)
+
+output.SetCardinality(final_count)
 ```
 
 ### 7.3 Source Files
@@ -513,30 +530,76 @@ output.SetCardinality(0)  // EOF
 duckdb_tae_scanner/
 ├── CMakeLists.txt                    Build config (DuckDB + LZ4)
 ├── DESIGN.md                         This document
+├── README.md                         Quick-start guide
 ├── tae_manifest_gen.py               Python: MO SQL → JSON manifest
 ├── include/
 │   ├── tae_types.hpp                 MO→DuckDB type mapping + Varlena
 │   ├── tae_object_reader.hpp         TAE binary format reader (structs + offsets)
 │   ├── tae_zonemap.hpp               Zone map evaluation for predicate pushdown
-│   └── tae_scanner.hpp               DuckDB TableFunction interface
-└── src/
-    ├── tae_object_reader.cpp         pread + LZ4 + vector decode + metadata parse
-    ├── tae_scanner.cpp               bind/init/execute + filter extraction + column fill
-    └── tae_scanner_extension.cpp     Extension entry point
+│   └── tae_scanner.hpp               State structs, OutputColumnInfo, PushedFilter
+├── src/
+│   ├── tae_object_reader.cpp         pread + LZ4 + vector decode + metadata parse
+│   ├── tae_scanner.cpp               bind/init/execute + filter + column fill
+│   └── tae_scanner_extension.cpp     Extension entry point
+└── test/
+    ├── gen_test_data.py              Python TAE binary writer (test fixtures)
+    ├── test_scan.cpp                 Catch2 end-to-end tests (70 tests)
+    └── data/                         Generated .tae files + manifest JSONs
 ```
 
 ### 7.4 Column Fill Dispatch
 
-The Execute function fills DuckDB output vectors based on column type:
+The Execute function fills DuckDB output vectors based on column type.
+Both FLAT and CONSTANT (single-value broadcast) MO vectors are supported.
 
 | Category | MO Types | Strategy |
 |----------|----------|----------|
-| Fixed-width | int8..int64, uint8..uint64, float32, float64, bool, uuid, enum, bit | `memcpy(dst, src, N × elem_size)` |
+| Fixed-width | int8..int64, uint8..uint64, float32/64, bool, decimal64, decimal128, enum, bit | `memcpy(dst, src, N × elem_size)` |
 | Date | T_date | `dst[i] = src[i] - 719162` |
 | Timestamp | T_datetime, T_timestamp | `dst[i] = src[i] - 62135596800000000` |
 | Varlena | char, varchar, text, blob, json, binary, varbinary | Decode Varlena → `StringVector::AddString()` |
-| Decimal | T_decimal64, T_decimal128 | Copy raw bytes, set DuckDB width/scale |
+| UUID | T_uuid | Per-row `UUID::FromBlob()` (big-endian → hugeint_t) |
+| CONSTANT | (any type, vec_class=1) | Set `CONSTANT_VECTOR` type, fill single value at pos 0 |
 | Null mask | (all types) | Iterate bitmap words, call `Validity.SetInvalid(i)` |
+
+### 7.5 Filter Pushdown Pipeline
+
+Filters are evaluated in two stages:
+
+1. **Zone map block skip** — reject entire blocks where zone map min/max
+   proves no rows can match. Supported for all numeric, decimal, date/timestamp,
+   string, and UUID types.
+
+2. **Per-row evaluation** — for blocks that pass zone maps, each row is
+   checked against all pushed filters. Rows that fail are compacted out via
+   `SelectionVector::Slice()`.
+
+### 7.6 Virtual Columns
+
+The extension exposes two virtual columns (DuckDB column IDs ≥ 2^63):
+
+| Virtual Column | Type | Value |
+|----------------|------|-------|
+| `file_path` | VARCHAR | TAE object file path from manifest |
+| `block_id` | INTEGER | Zero-based block index within the object |
+
+These are populated in the Execute phase via `fill_n` on flat vectors.
+
+### 7.7 DuckDB Callbacks
+
+| Callback | Purpose |
+|----------|---------|
+| `TAEScanBind` | Parse manifest, build schema |
+| `TAEScanInit` | Build output_map, extract filters, set up work queue |
+| `TAEScanInitLocal` | Per-thread state (reader cache, RNG) |
+| `TAEScanExecute` | Parallel block scan with atomic dispatch |
+| `TAEScanCardinality` | Row count estimate for planner |
+| `TAEScanStatistics` | Column min/max from zone maps |
+| `TAEScanProgress` | Scan completion percentage |
+| `TAEScanToString` | Static EXPLAIN info |
+| `TAEScanDynamicToString` | Runtime profiling info |
+| `TAEScanGetVirtualColumns` | Advertise file_path/block_id |
+| `TAEScanSupportsPushdownType` | Type-aware filter support |
 
 ---
 
@@ -743,25 +806,32 @@ optimal pipeline utilization.
 
 ## 12. Phased Implementation Plan
 
-### Phase 1: Local Filesystem + Static Schema (Current)
+### Phase 1: Local Filesystem + Static Schema ✅ Complete
 
 **Goal:** Run TPC-H queries on GPU via Sirius, reading MO data from local disk.
 
-**Scope:**
-- Read TAE objects from `mo-data/shared/` via `pread()`
-- Schema provided via JSON manifest file
-- Object list provided via manifest (from `mo_ctl inspect`)
-- Support all TPC-H column types (int, float, date, varchar, decimal)
-- Zone map predicate pushdown
-- No tombstone handling (clean TPC-H load, no deletes)
-- Single-threaded scan
+**Implemented:**
+- ✅ Read TAE objects from `mo-data/shared/` via DuckDB FileSystem (local + S3)
+- ✅ Schema provided via JSON manifest file
+- ✅ Full MO type support: int8–uint64, float32/64, bool, decimal64/128, date,
+  datetime, timestamp, char, varchar, text, json, blob, binary, varbinary, uuid, enum
+- ✅ Zone map predicate pushdown (block-level skip)
+- ✅ Per-row filter evaluation (all supported types)
+- ✅ CONSTANT vector support (single-value broadcast)
+- ✅ Projection pushdown (column pruning)
+- ✅ Parallel block scanning (atomic work dispatch, multi-threaded)
+- ✅ Planner statistics (cardinality + column min/max from zone maps)
+- ✅ Virtual columns (file_path, block_id)
+- ✅ Sampling pushdown (TABLESAMPLE SYSTEM via Bernoulli)
+- ✅ EXPLAIN integration (toString, dynamicToString)
+- ✅ Progress reporting
+- ✅ LZ4 decompression
+- ✅ 70 Catch2 tests, 380 assertions
 
 **Deliverables:**
-- `tae_scanner.so` DuckDB extension
-- `tae_manifest_gen.py` helper script to generate manifest from MO
-- TPC-H benchmark results (GPU vs CPU)
-
-**Estimated effort:** ~3,000 lines C++, ~500 lines Python
+- `tae_scanner.so` DuckDB extension (~1,100 lines C++)
+- `tae_manifest_gen.py` helper script
+- `test/gen_test_data.py` binary test data generator (~900 lines Python)
 
 ### Phase 2: S3 Support + Read Coalescing
 
@@ -770,7 +840,6 @@ optimal pipeline utilization.
 **Scope:**
 - ✅ Use DuckDB's `FileSystem` abstraction for transparent local/S3 routing (DONE)
 - HTTP Range request coalescing (batch column reads into one request)
-- Parallel object scanning (multi-threaded Init/Execute)
 - Tombstone filtering
 
 **Key change:** `TAEObjectReader` now uses `duckdb::FileSystem::Read()` instead of
@@ -804,12 +873,13 @@ transparently — any `s3://` path in the manifest works out of the box.
 ### 13.1 Prerequisites
 
 ```bash
-# DuckDB (source or installed)
+# DuckDB (source tree required for headers)
 git clone https://github.com/duckdb/duckdb.git
 cd duckdb && make release
 
 # LZ4
 sudo apt install liblz4-dev  # Ubuntu/Debian
+pacman -S lz4                 # Arch/Manjaro
 brew install lz4              # macOS
 ```
 
@@ -818,11 +888,32 @@ brew install lz4              # macOS
 ```bash
 cd duckdb_tae_scanner
 mkdir build && cd build
-cmake .. -DDUCKDB_DIR=/path/to/duckdb -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
+cmake .. -DDUCKDB_DIR=/path/to/duckdb \
+         -DCMAKE_CXX_COMPILER=clang++ \
+         -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc) tae_tests
 ```
 
-### 13.3 Test with TPC-H
+### 13.3 Unit Tests (Catch2)
+
+```bash
+# Generate test data (run from project root, not test/)
+cd duckdb_tae_scanner
+python3 test/gen_test_data.py
+
+# Run all 70 tests
+cd build && ./test/tae_tests
+
+# Run specific test tags
+./test/tae_tests "[types]"        # decimal, UUID, blob tests
+./test/tae_tests "[scan]"         # basic scan tests
+./test/tae_tests "[filter]"       # filter pushdown tests
+./test/tae_tests "[virtual]"      # virtual column tests
+./test/tae_tests "[sampling]"     # sampling tests
+./test/tae_tests "[constant]"     # CONSTANT vector tests
+```
+
+### 13.4 Test with TPC-H
 
 ```bash
 # 1. Start MO with local filesystem
