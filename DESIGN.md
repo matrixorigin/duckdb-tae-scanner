@@ -536,10 +536,14 @@ duckdb_tae_scanner/
 │   ├── tae_types.hpp                 MO→DuckDB type mapping + Varlena
 │   ├── tae_object_reader.hpp         TAE binary format reader (structs + offsets)
 │   ├── tae_zonemap.hpp               Zone map evaluation for predicate pushdown
-│   └── tae_scanner.hpp               State structs, OutputColumnInfo, PushedFilter
+│   ├── tae_scanner.hpp               State structs, OutputColumnInfo, PushedFilter
+│   ├── tae_column_fill.hpp           FillColumn() — copy TAE columns into DuckDB vectors
+│   └── tae_filter.hpp               Filter helpers: extract, zone map eval, per-row filter
 ├── src/
 │   ├── tae_object_reader.cpp         pread + LZ4 + vector decode + metadata parse
-│   ├── tae_scanner.cpp               bind/init/execute + filter + column fill
+│   ├── tae_column_fill.cpp           Column fill: Copy{Fixed,Date,Timestamp,Varlen,Uuid}, SetNullMask
+│   ├── tae_filter.cpp                Filter encode, ExtractFilter, BlockPassesFilters, ApplyRowFilters
+│   ├── tae_scanner.cpp               Manifest parse, bind, init, execute, statistics, callbacks
 │   └── tae_scanner_extension.cpp     Extension entry point
 └── test/
     ├── gen_test_data.py              Python TAE binary writer (test fixtures)
@@ -549,8 +553,9 @@ duckdb_tae_scanner/
 
 ### 7.4 Column Fill Dispatch
 
-The Execute function fills DuckDB output vectors based on column type.
-Both FLAT and CONSTANT (single-value broadcast) MO vectors are supported.
+The `FillColumn()` function (in `tae_column_fill.cpp`) fills DuckDB output
+vectors based on column type. Both FLAT and CONSTANT (single-value broadcast)
+MO vectors are supported.
 
 | Category | MO Types | Strategy |
 |----------|----------|----------|
@@ -564,7 +569,7 @@ Both FLAT and CONSTANT (single-value broadcast) MO vectors are supported.
 
 ### 7.5 Filter Pushdown Pipeline
 
-Filters are evaluated in two stages:
+Filters are evaluated in two stages (implemented in `tae_filter.cpp`):
 
 1. **Zone map block skip** — reject entire blocks where zone map min/max
    proves no rows can match. Supported for all numeric, decimal, date/timestamp,

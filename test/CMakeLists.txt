@@ -30,6 +30,8 @@ target_link_libraries(tae_tests PRIVATE
 # Link our extension's object files (reader + scanner logic)
 # We compile them as an OBJECT library so tests can access internal symbols.
 target_sources(tae_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/tae_column_fill.cpp
+    ${CMAKE_SOURCE_DIR}/src/tae_filter.cpp
     ${CMAKE_SOURCE_DIR}/src/tae_object_reader.cpp
     ${CMAKE_SOURCE_DIR}/src/tae_scanner.cpp
 )

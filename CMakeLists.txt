@@ -55,6 +55,8 @@ endif()
 # Extension shared library
 # ---------------------------------------------------------------------------
 add_library(tae_scanner SHARED
+    src/tae_column_fill.cpp
+    src/tae_filter.cpp
     src/tae_object_reader.cpp
     src/tae_scanner.cpp
     src/tae_scanner_extension.cpp
