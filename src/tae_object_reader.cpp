@@ -333,7 +333,7 @@ DecodedColumn TAEObjectReader::DecodeVector(const uint8_t *buf, uint32_t len) {
         col.is_sorted = (*p != 0);
     }
 
-    (void)vec_class; // TODO: handle CONSTANT vectors (single value for all rows)
+    col.vec_class = vec_class;
     return col;
 }
 

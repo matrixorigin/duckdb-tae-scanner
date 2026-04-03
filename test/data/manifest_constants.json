@@ -1,0 +1,26 @@
+{
+  "database": "test_db",
+  "table": "test_constants",
+  "columns": [
+    {
+      "name": "col_int",
+      "oid": 22
+    },
+    {
+      "name": "col_str",
+      "oid": 61
+    },
+    {
+      "name": "col_dbl",
+      "oid": 31
+    }
+  ],
+  "objects": [
+    {
+      "path": "with_constants.tae",
+      "rows": 8,
+      "blocks": 2,
+      "size": 2181
+    }
+  ]
+}

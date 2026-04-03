@@ -151,11 +151,12 @@ struct ObjectMeta {
 struct DecodedColumn {
     MOType                    type;
     uint32_t                  row_count;
-    std::vector<uint8_t>      data;        // fixed-width: N * elem_size bytes
+    std::vector<uint8_t>      data;        // fixed-width: N * elem_size bytes (or 1 elem for CONSTANT)
     std::vector<uint8_t>      area;        // varlena overflow area
     std::vector<uint64_t>     null_bitmap; // bit set = null
     uint64_t                  null_count;
     bool                      is_sorted;
+    uint8_t                   vec_class = 0; // 0=FLAT, 1=CONSTANT
 };
 
 // ---------------------------------------------------------------------------

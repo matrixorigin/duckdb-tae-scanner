@@ -15,6 +15,7 @@
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/enums/expression_type.hpp"
+#include "duckdb/common/vector/constant_vector.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
@@ -117,9 +118,93 @@ static void SetNullMask(duckdb::Vector &out_vec,
     }
 }
 
+// Fill a DuckDB CONSTANT_VECTOR from a single-element DecodedColumn
+static void FillConstantColumn(duckdb::Vector &out_vec,
+                               const DecodedColumn &col) {
+    out_vec.SetVectorType(duckdb::VectorType::CONSTANT_VECTOR);
+
+    // Constant NULL: data is empty, null_count > 0
+    if (col.data.empty()) {
+        duckdb::ConstantVector::SetNull(out_vec, true);
+        return;
+    }
+
+    // Check if position 0 is null in bitmap
+    bool is_null = false;
+    if (col.null_count > 0 && !col.null_bitmap.empty()) {
+        is_null = (col.null_bitmap[0] & 1ULL) != 0;
+    }
+    if (is_null) {
+        duckdb::ConstantVector::SetNull(out_vec, true);
+        return;
+    }
+
+    auto oid = static_cast<MOTypeOid>(col.type.oid);
+    switch (oid) {
+    case MO_T_date: {
+        auto *src = reinterpret_cast<const int32_t *>(col.data.data());
+        auto *dst = duckdb::ConstantVector::GetData<int32_t>(out_vec);
+        dst[0] = src[0] - MO_UNIX_EPOCH_DAYS;
+        break;
+    }
+    case MO_T_datetime:
+    case MO_T_timestamp: {
+        auto *src = reinterpret_cast<const int64_t *>(col.data.data());
+        auto *dst = duckdb::ConstantVector::GetData<int64_t>(out_vec);
+        dst[0] = src[0] - MO_UNIX_EPOCH_USEC;
+        break;
+    }
+    case MO_T_char:
+    case MO_T_varchar:
+    case MO_T_blob:
+    case MO_T_text:
+    case MO_T_json:
+    case MO_T_binary:
+    case MO_T_varbinary:
+    case MO_T_datalink: {
+        auto *src = reinterpret_cast<const Varlena *>(col.data.data());
+        const uint8_t *area = col.area.data();
+        const auto &v = src[0];
+        const char *str_data;
+        uint32_t str_len;
+        if (v.is_inline()) {
+            str_len = v.inline_length();
+            str_data = v.inline_data();
+        } else {
+            uint32_t big_marker;
+            memcpy(&big_marker, v.data, 4);
+            if (big_marker != VARLENA_BIG_MARKER) {
+                str_data = "";
+                str_len = 0;
+            } else {
+                str_data = reinterpret_cast<const char *>(area + v.big_offset());
+                str_len = v.big_length();
+            }
+        }
+        auto target = duckdb::StringVector::AddString(out_vec, str_data, str_len);
+        duckdb::ConstantVector::GetData<duckdb::string_t>(out_vec)[0] = target;
+        break;
+    }
+    default: {
+        auto elem_size = MOTypeFixedSize(oid);
+        if (elem_size <= 0) break;
+        auto *dst = duckdb::ConstantVector::GetData(out_vec);
+        memcpy(dst, col.data.data(), static_cast<size_t>(elem_size));
+        break;
+    }
+    }
+}
+
 static void FillColumn(duckdb::Vector &out_vec,
                         const DecodedColumn &col,
                         duckdb::idx_t count) {
+    // CONSTANT vector: single value for all rows
+    if (col.vec_class == 1) {
+        FillConstantColumn(out_vec, col);
+        return;
+    }
+
+    // FLAT vector: per-row data
     switch (static_cast<MOTypeOid>(col.type.oid)) {
     case MO_T_date:
         CopyDateColumn(out_vec, col, count);

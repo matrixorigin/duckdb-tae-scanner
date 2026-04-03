@@ -442,3 +442,78 @@ TEST_CASE("Scan: TABLESAMPLE SYSTEM 0% returns no rows", "[scan][sample]") {
     // 0% should return 0 rows (rate=0, all rows rejected)
     REQUIRE(result->RowCount() == 0);
 }
+
+// ===================================================================
+// Constant vector handling
+// ===================================================================
+
+TEST_CASE("Scan: constant int column returns same value for all rows", "[scan][constant]") {
+    auto db = MakeDB();
+    // Block 0 has col_int = CONSTANT(42), 4 rows
+    // Block 1 has col_int = FLAT [10,20,30,40], 4 rows
+    auto result = Query(*db, "SELECT col_int FROM tae_scan('" +
+                              ManifestPath("manifest_constants.json") +
+                              "') ORDER BY col_int");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 8);
+    // Sorted: 10, 20, 30, 40, 42, 42, 42, 42
+    CHECK(result->GetValue(0, 0) == Value::INTEGER(10));
+    CHECK(result->GetValue(0, 1) == Value::INTEGER(20));
+    CHECK(result->GetValue(0, 2) == Value::INTEGER(30));
+    CHECK(result->GetValue(0, 3) == Value::INTEGER(40));
+    CHECK(result->GetValue(0, 4) == Value::INTEGER(42));
+    CHECK(result->GetValue(0, 5) == Value::INTEGER(42));
+    CHECK(result->GetValue(0, 6) == Value::INTEGER(42));
+    CHECK(result->GetValue(0, 7) == Value::INTEGER(42));
+}
+
+TEST_CASE("Scan: constant string column returns same value for all rows", "[scan][constant]") {
+    auto db = MakeDB();
+    // Block 1 has col_str = CONSTANT('hello'), 4 rows
+    auto result = Query(*db, "SELECT col_str FROM tae_scan('" +
+                              ManifestPath("manifest_constants.json") +
+                              "') ORDER BY col_str");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 8);
+    // Block 0 has flat strings a,b,c,d; block 1 has constant 'hello'
+    // Sorted: a, b, c, d, hello, hello, hello, hello
+    CHECK(result->GetValue(0, 0) == Value("a"));
+    CHECK(result->GetValue(0, 3) == Value("d"));
+    CHECK(result->GetValue(0, 4) == Value("hello"));
+    CHECK(result->GetValue(0, 7) == Value("hello"));
+}
+
+TEST_CASE("Scan: constant NULL double column returns NULLs", "[scan][constant]") {
+    auto db = MakeDB();
+    // Block 0 has col_dbl = CONSTANT(3.14); block 1 has CONSTANT_NULL
+    auto result = Query(*db, "SELECT col_dbl FROM tae_scan('" +
+                              ManifestPath("manifest_constants.json") + "')");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 8);
+    // Count non-null and null values
+    int null_count = 0;
+    int nonnull_count = 0;
+    for (idx_t i = 0; i < 8; i++) {
+        if (result->GetValue(0, i).IsNull()) {
+            null_count++;
+        } else {
+            nonnull_count++;
+            CHECK(result->GetValue(0, i).GetValue<double>() == Approx(3.14));
+        }
+    }
+    CHECK(null_count == 4);      // block 1: 4 constant NULLs
+    CHECK(nonnull_count == 4);   // block 0: 4 constant 3.14
+}
+
+TEST_CASE("Scan: mixed constant/flat columns work together", "[scan][constant]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT col_int, col_str, col_dbl FROM tae_scan('" +
+                              ManifestPath("manifest_constants.json") +
+                              "') ORDER BY col_int, col_str");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 8);
+    // Row with col_int=10 comes from block 1 (int=FLAT, str=CONST 'hello', dbl=CONST_NULL)
+    CHECK(result->GetValue(0, 0) == Value::INTEGER(10));
+    CHECK(result->GetValue(1, 0) == Value("hello"));
+    CHECK(result->GetValue(2, 0).IsNull());
+}

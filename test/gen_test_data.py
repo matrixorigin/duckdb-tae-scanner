@@ -240,7 +240,7 @@ def build_vector(mo_type_oid, elem_size, values, nulls=None, is_varchar=False):
 
     # Assemble vector binary
     buf = bytearray()
-    buf += struct.pack('<B', 1)  # class = FLAT
+    buf += struct.pack('<B', 0)  # class: 0=FLAT, 1=CONSTANT
     buf += pack_mo_type(mo_type_oid, actual_elem_size)  # 16 bytes
     buf += struct.pack('<I', row_count)  # length
     buf += struct.pack('<I', len(data_bytes))  # dataLen
@@ -251,6 +251,56 @@ def build_vector(mo_type_oid, elem_size, values, nulls=None, is_varchar=False):
     buf += nsp_bytes
     buf += struct.pack('<B', 0)  # sorted = false
 
+    return bytes(buf)
+
+
+def build_constant_vector(mo_type_oid, elem_size, value, row_count,
+                          is_null=False, is_varchar=False):
+    """Build a CONSTANT vector: single value repeated for row_count rows.
+
+    If is_null=True, builds a constant-NULL vector (no data).
+    """
+    if is_null:
+        data_bytes = b''
+        area_bytes = b''
+        actual_elem_size = -24 if is_varchar else elem_size
+        nsp_bytes = build_null_bitmap([True] * row_count, row_count)
+    elif is_varchar:
+        s = value.encode('utf-8')
+        if len(s) <= VARLENA_INLINE_MAX:
+            slot = bytearray(VARLENA_SIZE)
+            slot[0] = len(s)
+            slot[1:1 + len(s)] = s
+            data_bytes = bytes(slot)
+        else:
+            raise ValueError("constant string too long for inline varlena")
+        area_bytes = b''
+        actual_elem_size = -24
+        nsp_bytes = build_null_bitmap([False] * row_count, row_count)
+    else:
+        if mo_type_oid == MO_T_INT32:
+            data_bytes = struct.pack('<i', value)
+        elif mo_type_oid == MO_T_FLOAT64:
+            data_bytes = struct.pack('<d', value)
+        elif mo_type_oid == MO_T_BOOL:
+            data_bytes = bytes([1 if value else 0])
+        else:
+            raise ValueError(f"unsupported constant type OID {mo_type_oid}")
+        area_bytes = b''
+        actual_elem_size = elem_size
+        nsp_bytes = build_null_bitmap([False] * row_count, row_count)
+
+    buf = bytearray()
+    buf += struct.pack('<B', 1)  # class: 1=CONSTANT
+    buf += pack_mo_type(mo_type_oid, actual_elem_size)
+    buf += struct.pack('<I', row_count)
+    buf += struct.pack('<I', len(data_bytes))
+    buf += data_bytes
+    buf += struct.pack('<I', len(area_bytes))
+    buf += area_bytes
+    buf += struct.pack('<I', len(nsp_bytes))
+    buf += nsp_bytes
+    buf += struct.pack('<B', 0)  # sorted = false
     return bytes(buf)
 
 
@@ -578,6 +628,70 @@ def gen_basic_3col_part2(outdir):
     return path
 
 
+def gen_with_constants(outdir):
+    """Generate a 2-block file with constant vectors mixed with flat vectors.
+
+    Block 0: col_int=CONSTANT(42), col_str=FLAT[a,b,c,d], col_dbl=CONSTANT(3.14), 4 rows
+    Block 1: col_int=FLAT[10,20,30,40], col_str=CONSTANT('hello'), col_dbl=CONSTANT_NULL, 4 rows
+    """
+    builder = TAEFileBuilder()
+
+    # Block 0: int=const 42, str=flat, dbl=const 3.14
+    builder.add_block({
+        'rows': 4,
+        'columns': [
+            {
+                'mo_type': MO_T_INT32,
+                'vector_bytes': build_constant_vector(MO_T_INT32, 4, 42, 4),
+                'zone_map': build_zone_map_numeric(MO_T_INT32, 42, 42, 4),
+                'ndv': 1,
+            },
+            {
+                'mo_type': MO_T_VARCHAR,
+                'vector_bytes': build_vector(MO_T_VARCHAR, -24, ['a', 'b', 'c', 'd'], is_varchar=True),
+                'zone_map': build_zone_map_string(MO_T_VARCHAR, 'a', 'd'),
+                'ndv': 4,
+            },
+            {
+                'mo_type': MO_T_FLOAT64,
+                'vector_bytes': build_constant_vector(MO_T_FLOAT64, 8, 3.14, 4),
+                'zone_map': build_zone_map_numeric(MO_T_FLOAT64, 3.14, 3.14, 8),
+                'ndv': 1,
+            },
+        ],
+    })
+
+    # Block 1: int=flat, str=const 'hello', dbl=const NULL
+    builder.add_block({
+        'rows': 4,
+        'columns': [
+            {
+                'mo_type': MO_T_INT32,
+                'vector_bytes': build_vector(MO_T_INT32, 4, [10, 20, 30, 40]),
+                'zone_map': build_zone_map_numeric(MO_T_INT32, 10, 40, 4),
+                'ndv': 4,
+            },
+            {
+                'mo_type': MO_T_VARCHAR,
+                'vector_bytes': build_constant_vector(MO_T_VARCHAR, -24, 'hello', 4, is_varchar=True),
+                'zone_map': build_zone_map_string(MO_T_VARCHAR, 'hello', 'hello'),
+                'ndv': 1,
+            },
+            {
+                'mo_type': MO_T_FLOAT64,
+                'vector_bytes': build_constant_vector(MO_T_FLOAT64, 8, 0.0, 4, is_null=True),
+                'zone_map': build_zone_map_numeric(MO_T_FLOAT64, 0.0, 0.0, 8),
+                'ndv': 0,
+            },
+        ],
+    })
+
+    path = os.path.join(outdir, 'with_constants.tae')
+    with open(path, 'wb') as f:
+        f.write(builder.build())
+    return path
+
+
 def gen_manifest(outdir, files):
     """Generate manifest JSON for the test data."""
     manifest = {
@@ -613,6 +727,7 @@ def main():
     multi_path = gen_multi_block(outdir)
     nulls_path = gen_with_nulls(outdir)
     part2_path = gen_basic_3col_part2(outdir)
+    const_path = gen_with_constants(outdir)
 
     gen_manifest(outdir, [basic_path])
 
@@ -644,13 +759,37 @@ def main():
     with open(mf_path, 'w') as f:
         json.dump(multifile_manifest, f, indent=2)
 
+    # Constant vector manifest
+    const_manifest = {
+        'database': 'test_db',
+        'table': 'test_constants',
+        'columns': [
+            {'name': 'col_int', 'oid': MO_T_INT32},
+            {'name': 'col_str', 'oid': MO_T_VARCHAR},
+            {'name': 'col_dbl', 'oid': MO_T_FLOAT64},
+        ],
+        'objects': [
+            {
+                'path': os.path.basename(const_path),
+                'rows': 8,
+                'blocks': 2,
+                'size': os.path.getsize(const_path),
+            },
+        ],
+    }
+    const_mf_path = os.path.join(outdir, 'manifest_constants.json')
+    with open(const_mf_path, 'w') as f:
+        json.dump(const_manifest, f, indent=2)
+
     print(f'Generated test data in {outdir}/')
     print(f'  {os.path.basename(basic_path)}  ({os.path.getsize(basic_path)} bytes)')
     print(f'  {os.path.basename(part2_path)}  ({os.path.getsize(part2_path)} bytes)')
     print(f'  {os.path.basename(multi_path)}  ({os.path.getsize(multi_path)} bytes)')
     print(f'  {os.path.basename(nulls_path)}  ({os.path.getsize(nulls_path)} bytes)')
+    print(f'  {os.path.basename(const_path)}  ({os.path.getsize(const_path)} bytes)')
     print(f'  manifest.json')
     print(f'  manifest_multifile.json')
+    print(f'  manifest_constants.json')
 
 
 if __name__ == '__main__':
