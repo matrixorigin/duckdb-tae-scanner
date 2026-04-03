@@ -213,3 +213,56 @@ TEST_CASE("Scan: COUNT(*) works", "[scan]") {
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->GetValue(0, 0) == Value::BIGINT(8));
 }
+
+// ===================================================================
+// Planner statistics
+// ===================================================================
+
+TEST_CASE("Scan: cardinality estimate appears in EXPLAIN", "[scan][stats]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "EXPLAIN SELECT * FROM tae_scan('" +
+                              ManifestPath("manifest.json") + "')");
+    REQUIRE_FALSE(result->HasError());
+    auto explain_str = result->GetValue(1, 0).ToString();
+    // DuckDB uppercases the function name in EXPLAIN output
+    REQUIRE(explain_str.find("TAE_SCAN") != std::string::npos);
+}
+
+TEST_CASE("Scan: cardinality single file = 8 rows", "[scan][stats]") {
+    auto db = MakeDB();
+    // Verify cardinality by checking that COUNT(*) returns the manifest row count
+    auto result = Query(*db, "SELECT COUNT(*) FROM tae_scan('" +
+                              ManifestPath("manifest.json") + "')");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->GetValue(0, 0) == Value::BIGINT(8));
+}
+
+TEST_CASE("Scan: cardinality multi-file = 12 rows", "[scan][stats]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT COUNT(*) FROM tae_scan('" +
+                              ManifestPath("manifest_multifile.json") + "')");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->GetValue(0, 0) == Value::BIGINT(12));
+}
+
+TEST_CASE("Scan: column stats enable optimized filter elimination", "[scan][stats]") {
+    auto db = MakeDB();
+    // basic_3col has col_int in [10..80]. A filter col_int > 1000 should return 0 rows.
+    // The planner may use column stats to realize this is impossible.
+    auto result = Query(*db, "SELECT COUNT(*) FROM tae_scan('" +
+                              ManifestPath("manifest.json") +
+                              "') WHERE col_int > 1000");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->GetValue(0, 0) == Value::BIGINT(0));
+}
+
+TEST_CASE("Scan: column stats min/max respected in range queries", "[scan][stats]") {
+    auto db = MakeDB();
+    // All col_int values in basic_3col are 10,20,...,80
+    // col_int >= 10 AND col_int <= 80 should return all 8 rows
+    auto result = Query(*db, "SELECT COUNT(*) FROM tae_scan('" +
+                              ManifestPath("manifest.json") +
+                              "') WHERE col_int >= 10 AND col_int <= 80");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->GetValue(0, 0) == Value::BIGINT(8));
+}

@@ -58,6 +58,7 @@ struct TAEScanBindData : public duckdb::TableFunctionData {
 
     // Object list
     std::vector<TAEObjectInfo>     objects;
+    duckdb::idx_t                  total_rows = 0; // sum of all objects' row counts
 };
 
 // ---------------------------------------------------------------------------

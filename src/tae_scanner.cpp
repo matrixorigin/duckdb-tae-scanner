@@ -20,6 +20,10 @@
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
 #include "duckdb/planner/table_filter_set.hpp"
+#include "duckdb/storage/statistics/node_statistics.hpp"
+#include "duckdb/storage/statistics/base_statistics.hpp"
+#include "duckdb/storage/statistics/numeric_stats.hpp"
+#include "duckdb/storage/statistics/string_stats.hpp"
 
 #include <cstring>
 #include <fstream>
@@ -523,6 +527,10 @@ static void ParseManifest(const std::string &manifest_path,
         bind.objects.push_back(std::move(info));
     }
 
+    // Compute total row count for cardinality estimation
+    bind.total_rows = 0;
+    for (auto &o : bind.objects) bind.total_rows += o.rows;
+
     yyjson_doc_free(doc);
 }
 
@@ -652,6 +660,163 @@ static void TAEScanExecute(duckdb::ClientContext &context,
 }
 
 // ===================================================================
+// Cardinality — provide row-count estimate from manifest metadata
+// ===================================================================
+static duckdb::unique_ptr<duckdb::NodeStatistics>
+TAEScanCardinality(duckdb::ClientContext &context,
+                   const duckdb::FunctionData *bind_data_p) {
+    if (!bind_data_p) return nullptr;
+    auto &bind = bind_data_p->Cast<TAEScanBindData>();
+    return duckdb::make_uniq<duckdb::NodeStatistics>(bind.total_rows, bind.total_rows);
+}
+
+// ===================================================================
+// Statistics — provide column-level min/max from zone maps
+// ===================================================================
+
+// Decode a fixed-width zone-map value to a DuckDB Value.
+static duckdb::Value ZoneMapBytesToValue(const uint8_t *ptr, MOTypeOid oid) {
+    switch (oid) {
+    case MO_T_int8:      { int8_t v;   memcpy(&v, ptr, sizeof(v));  return duckdb::Value::TINYINT(v); }
+    case MO_T_int16:     { int16_t v;  memcpy(&v, ptr, sizeof(v));  return duckdb::Value::SMALLINT(v); }
+    case MO_T_int32:     { int32_t v;  memcpy(&v, ptr, sizeof(v));  return duckdb::Value::INTEGER(v); }
+    case MO_T_int64:     { int64_t v;  memcpy(&v, ptr, sizeof(v));  return duckdb::Value::BIGINT(v); }
+    case MO_T_uint8:     { uint8_t v;  memcpy(&v, ptr, sizeof(v));  return duckdb::Value::UTINYINT(v); }
+    case MO_T_uint16:    { uint16_t v; memcpy(&v, ptr, sizeof(v));  return duckdb::Value::USMALLINT(v); }
+    case MO_T_uint32:    { uint32_t v; memcpy(&v, ptr, sizeof(v));  return duckdb::Value::UINTEGER(v); }
+    case MO_T_uint64:    { uint64_t v; memcpy(&v, ptr, sizeof(v));  return duckdb::Value::UBIGINT(v); }
+    case MO_T_float32:   { float v;    memcpy(&v, ptr, sizeof(v));  return duckdb::Value::FLOAT(v); }
+    case MO_T_float64:   { double v;   memcpy(&v, ptr, sizeof(v));  return duckdb::Value::DOUBLE(v); }
+    case MO_T_bool:      { return duckdb::Value::BOOLEAN(ptr[0] != 0); }
+    case MO_T_date: {
+        int32_t v; memcpy(&v, ptr, sizeof(v));
+        return duckdb::Value::DATE(duckdb::Date::EpochDaysToDate(v));
+    }
+    case MO_T_datetime:
+    case MO_T_timestamp: {
+        int64_t v; memcpy(&v, ptr, sizeof(v));
+        return duckdb::Value::TIMESTAMP(duckdb::Timestamp::FromEpochMicroSeconds(v));
+    }
+    default: return duckdb::Value();
+    }
+}
+
+// Decode a string zone-map value (first 32 bytes = varlena-style prefix).
+static std::string ZoneMapBytesToString(const uint8_t *ptr) {
+    // Zone map stores fixed 32 bytes; for short strings this is inline.
+    // Layout: first byte encodes length in upper bits for inline case.
+    auto *v = reinterpret_cast<const Varlena *>(ptr);
+    if (v->is_inline()) {
+        return std::string(v->inline_data(), v->inline_length());
+    }
+    // Big varlena in zone map: shouldn't happen (zone map stores truncated prefix).
+    // Use the raw 23 bytes as an approximation.
+    return std::string(v->inline_data(), 23);
+}
+
+static duckdb::unique_ptr<duckdb::BaseStatistics>
+TAEScanStatistics(duckdb::ClientContext &context,
+                  const duckdb::FunctionData *bind_data_p,
+                  duckdb::column_t column_index) {
+    if (!bind_data_p) return nullptr;
+    auto &bind = bind_data_p->Cast<TAEScanBindData>();
+
+    if (column_index >= bind.all_col_types.size()) return nullptr;
+
+    auto &col_type = bind.all_col_types[column_index];
+    auto oid = static_cast<MOTypeOid>(bind.all_col_mo_oids[column_index]);
+    uint16_t seqnum = static_cast<uint16_t>(column_index);
+
+    // Open each object and merge zone maps for this column
+    bool has_stats = false;
+    duckdb::Value global_min, global_max;
+    bool has_nulls = false;
+
+    for (auto &obj : bind.objects) {
+        std::string full_path = bind.data_dir + "/" + obj.file_path;
+        try {
+            auto &fs = duckdb::FileSystem::GetFileSystem(context);
+            TAEObjectReader reader(fs, full_path);
+
+            for (uint32_t blk = 0; blk < reader.BlockCount(); blk++) {
+                const uint8_t *zm = reader.GetZoneMap(blk, seqnum);
+                if (!zm) continue;
+
+                // zone map layout: [min 32B][max 32B][has_null 1B][...] = 64 bytes
+                const uint8_t *zm_min = zm;
+                const uint8_t *zm_max = zm + 32;
+
+                if (IsStringType(oid)) {
+                    auto min_str = ZoneMapBytesToString(zm_min);
+                    auto max_str = ZoneMapBytesToString(zm_max);
+                    auto min_val = duckdb::Value(min_str);
+                    auto max_val = duckdb::Value(max_str);
+                    if (!has_stats) {
+                        global_min = min_val;
+                        global_max = max_val;
+                        has_stats = true;
+                    } else {
+                        if (min_val < global_min) global_min = min_val;
+                        if (max_val > global_max) global_max = max_val;
+                    }
+                } else {
+                    auto min_val = ZoneMapBytesToValue(zm_min, oid);
+                    auto max_val = ZoneMapBytesToValue(zm_max, oid);
+                    if (min_val.IsNull() || max_val.IsNull()) continue;
+                    if (!has_stats) {
+                        global_min = min_val;
+                        global_max = max_val;
+                        has_stats = true;
+                    } else {
+                        if (min_val < global_min) global_min = min_val;
+                        if (max_val > global_max) global_max = max_val;
+                    }
+                }
+
+                // Check null flag
+                if (zm[64] != 0) has_nulls = true;
+            }
+        } catch (...) {
+            return nullptr; // can't read → no stats
+        }
+    }
+
+    if (!has_stats) return nullptr;
+
+    auto stats = duckdb::BaseStatistics::CreateEmpty(col_type);
+    if (has_nulls) stats.SetHasNull();
+    if (!has_nulls) stats.SetHasNoNull();
+
+    switch (col_type.InternalType()) {
+    case duckdb::PhysicalType::INT8:
+    case duckdb::PhysicalType::INT16:
+    case duckdb::PhysicalType::INT32:
+    case duckdb::PhysicalType::INT64:
+    case duckdb::PhysicalType::UINT8:
+    case duckdb::PhysicalType::UINT16:
+    case duckdb::PhysicalType::UINT32:
+    case duckdb::PhysicalType::UINT64:
+    case duckdb::PhysicalType::FLOAT:
+    case duckdb::PhysicalType::DOUBLE:
+    case duckdb::PhysicalType::BOOL:
+        duckdb::NumericStats::SetMin(stats, global_min);
+        duckdb::NumericStats::SetMax(stats, global_max);
+        break;
+    case duckdb::PhysicalType::VARCHAR: {
+        auto min_sv = duckdb::StringValue::Get(global_min);
+        auto max_sv = duckdb::StringValue::Get(global_max);
+        duckdb::StringStats::Update(stats, min_sv);
+        duckdb::StringStats::Update(stats, max_sv);
+        break;
+    }
+    default:
+        return nullptr;
+    }
+
+    return duckdb::make_uniq<duckdb::BaseStatistics>(std::move(stats));
+}
+
+// ===================================================================
 // GetTAEScanFunction — construct the TableFunction with filter pushdown
 // ===================================================================
 duckdb::TableFunction GetTAEScanFunction() {
@@ -663,6 +828,8 @@ duckdb::TableFunction GetTAEScanFunction() {
     func.projection_pushdown = true;
     func.filter_pushdown = true;
     func.filter_prune = true;
+    func.cardinality = TAEScanCardinality;
+    func.statistics = TAEScanStatistics;
 
     return func;
 }
