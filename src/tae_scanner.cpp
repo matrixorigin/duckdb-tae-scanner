@@ -16,10 +16,10 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/enums/expression_type.hpp"
 #include "duckdb/function/table_function.hpp"
-#include "duckdb/main/extension_util.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
 
 #include <cstring>
 #include <fstream>
@@ -27,6 +27,7 @@
 
 // Minimal JSON parsing (header-only, bundled with DuckDB)
 #include "yyjson.hpp"
+using namespace duckdb_yyjson; // NOLINT
 
 namespace tae {
 
@@ -396,8 +397,8 @@ static void ParseManifest(const std::string &manifest_path,
 static duckdb::unique_ptr<duckdb::FunctionData>
 TAEScanBind(duckdb::ClientContext &context,
             duckdb::TableFunctionBindInput &input,
-            std::vector<duckdb::LogicalType> &return_types,
-            std::vector<std::string> &names) {
+            duckdb::vector<duckdb::LogicalType> &return_types,
+            duckdb::vector<duckdb::string> &names) {
 
     auto bind_data = duckdb::make_uniq<TAEScanBindData>();
     auto manifest_path = input.inputs[0].GetValue<std::string>();
@@ -424,26 +425,24 @@ static duckdb::unique_ptr<duckdb::GlobalTableFunctionState>
 TAEScanInit(duckdb::ClientContext &context,
             duckdb::TableFunctionInitInput &input) {
     auto &bind = input.bind_data->Cast<TAEScanBindData>();
+    auto state = duckdb::make_uniq<TAEScanState>();
 
     // Resolve projected columns → TAE seqnums
-    bind.projected_col_indices.clear();
-    bind.read_seqnums.clear();
     for (auto &col_id : input.column_ids) {
         auto idx = static_cast<duckdb::idx_t>(col_id);
-        bind.projected_col_indices.push_back(idx);
-        bind.read_seqnums.push_back(static_cast<uint16_t>(idx));
+        state->projected_col_indices.push_back(idx);
+        state->read_seqnums.push_back(static_cast<uint16_t>(idx));
     }
 
     // Extract pushed-down filters from DuckDB's TableFilterSet
-    bind.filters.clear();
     if (input.filters) {
         for (auto &entry : *input.filters) {
-            auto proj_idx = entry.GetIndex();
+            auto proj_idx = static_cast<duckdb::idx_t>(entry.GetIndex());
             auto &filter = entry.Filter();
 
             // Map projection index → table column index
-            if (proj_idx >= bind.projected_col_indices.size()) continue;
-            auto table_col = bind.projected_col_indices[proj_idx];
+            if (proj_idx >= state->projected_col_indices.size()) continue;
+            auto table_col = state->projected_col_indices[proj_idx];
             if (table_col >= bind.all_col_mo_oids.size()) continue;
 
             uint8_t mo_oid = bind.all_col_mo_oids[table_col];
@@ -452,11 +451,11 @@ TAEScanInit(duckdb::ClientContext &context,
             ExtractFilter(filter,
                           static_cast<uint16_t>(proj_idx),
                           seqnum, mo_oid,
-                          bind.filters);
+                          state->filters);
         }
     }
 
-    return duckdb::make_uniq<TAEScanState>();
+    return std::move(state);
 }
 
 // ===================================================================
@@ -484,15 +483,15 @@ static void TAEScanExecute(duckdb::ClientContext &context,
             auto blk = static_cast<uint32_t>(state.current_block);
             state.current_block++;
 
-            if (!bind.filters.empty() &&
-                !BlockPassesFilters(bind.filters, *state.reader, blk)) {
+            if (!state.filters.empty() &&
+                !BlockPassesFilters(state.filters, *state.reader, blk)) {
                 state.blocks_skipped++;
                 continue;
             }
 
             // Read the block
             state.blocks_scanned++;
-            auto decoded_cols = state.reader->ReadBlock(blk, bind.read_seqnums);
+            auto decoded_cols = state.reader->ReadBlock(blk, state.read_seqnums);
             if (decoded_cols.empty()) continue;
 
             duckdb::idx_t row_count = decoded_cols[0].row_count;
@@ -518,10 +517,9 @@ static void TAEScanExecute(duckdb::ClientContext &context,
 duckdb::TableFunction GetTAEScanFunction() {
     duckdb::TableFunction func("tae_scan",
                                 {duckdb::LogicalType::VARCHAR},  // manifest path
-                                TAEScanExecute,
-                                TAEScanBind,
-                                TAEScanInit);
-
+                                TAEScanExecute);
+    func.bind = TAEScanBind;
+    func.init_global = TAEScanInit;
     func.projection_pushdown = true;
     func.filter_pushdown = true;
     func.filter_prune = true;

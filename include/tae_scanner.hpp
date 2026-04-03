@@ -44,7 +44,7 @@ struct PushedFilter {
 };
 
 // ---------------------------------------------------------------------------
-// Bind data — schema + object list + filters, computed once per query
+// Bind data — schema + object list, computed once per query (const after bind)
 // ---------------------------------------------------------------------------
 struct TAEScanBindData : public duckdb::TableFunctionData {
     std::string                    data_dir;
@@ -56,23 +56,21 @@ struct TAEScanBindData : public duckdb::TableFunctionData {
     std::vector<duckdb::LogicalType> all_col_types;
     std::vector<uint8_t>           all_col_mo_oids; // MO type OID per column
 
-    // Projection: which columns the query actually needs
-    std::vector<duckdb::idx_t>     projected_col_indices; // into all_col_*
-
     // Object list
     std::vector<TAEObjectInfo>     objects;
+};
 
-    // Column seqnums to read from TAE (mapped from projected columns)
+// ---------------------------------------------------------------------------
+// Init state — per-thread scan state (mutable during scan)
+// ---------------------------------------------------------------------------
+struct TAEScanState : public duckdb::GlobalTableFunctionState {
+    // Projection: which columns the query actually needs
+    std::vector<duckdb::idx_t>     projected_col_indices; // into all_col_*
     std::vector<uint16_t>          read_seqnums;
 
     // Pushed-down filters (populated from DuckDB TableFilterSet)
     std::vector<PushedFilter>      filters;
-};
 
-// ---------------------------------------------------------------------------
-// Init state — per-thread scan state
-// ---------------------------------------------------------------------------
-struct TAEScanState : public duckdb::GlobalTableFunctionState {
     // Current position
     duckdb::idx_t current_object = 0;
     duckdb::idx_t current_block  = 0;

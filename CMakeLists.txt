@@ -18,7 +18,10 @@ if(NOT DuckDB_FOUND)
     # Source-tree: add as subdirectory
     if(EXISTS ${DUCKDB_DIR}/CMakeLists.txt)
         add_subdirectory(${DUCKDB_DIR} duckdb_build EXCLUDE_FROM_ALL)
-        set(DUCKDB_INCLUDE_DIRS ${DUCKDB_DIR}/src/include)
+        set(DUCKDB_INCLUDE_DIRS
+            ${DUCKDB_DIR}/src/include
+            ${DUCKDB_DIR}/third_party/yyjson/include
+        )
         set(DUCKDB_LIBRARIES duckdb)
     else()
         # Headers + lib in install prefix

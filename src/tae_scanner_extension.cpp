@@ -7,15 +7,14 @@
 
 #include "tae_scanner.hpp"
 #include "duckdb.hpp"
-#include "duckdb/main/extension_util.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 
 namespace tae {
 
 class TAEScannerExtension : public duckdb::Extension {
 public:
-    void Load(duckdb::DuckDB &db) override {
-        auto &instance = *db.instance;
-        duckdb::ExtensionUtil::RegisterFunction(instance, GetTAEScanFunction());
+    void Load(duckdb::ExtensionLoader &loader) override {
+        loader.RegisterFunction(GetTAEScanFunction());
     }
 
     std::string Name() override {
@@ -31,8 +30,8 @@ public:
 
 extern "C" {
 
-DUCKDB_EXTENSION_API void tae_scanner_init(duckdb::DatabaseInstance &instance) {
-    duckdb::ExtensionUtil::RegisterFunction(instance, tae::GetTAEScanFunction());
+DUCKDB_CPP_EXTENSION_ENTRY(tae_scanner, loader) {
+    loader.RegisterFunction(tae::GetTAEScanFunction());
 }
 
 DUCKDB_EXTENSION_API const char *tae_scanner_version() {

@@ -372,3 +372,5 @@ std::vector<DecodedColumn> TAEObjectReader::ReadBlock(
 
     return result;
 }
+
+} // namespace tae
