@@ -31,10 +31,33 @@ TAEObjectReader::~TAEObjectReader() {
 
 // ---------------------------------------------------------------------------
 // ReadBytes — read raw bytes from file at a given offset
-// Uses DuckDB FileSystem random-access read (works for local, S3, HTTP, etc.)
+//
+// If the file fits within prefetch_threshold_, the entire file is read on the
+// first call and cached. All subsequent reads are served from the cache with
+// zero additional I/O. This reduces S3 round-trips from O(columns × blocks)
+// to exactly 1 for small-to-medium files (≤ 4 MB by default).
+//
+// For larger files, each call issues a separate FileSystem read.
 // ---------------------------------------------------------------------------
 
 std::vector<uint8_t> TAEObjectReader::ReadBytes(uint64_t offset, uint64_t length) {
+    // Attempt prefetch on first call
+    if (!prefetch_attempted_) {
+        prefetch_attempted_ = true;
+        if (file_size_ <= prefetch_threshold_) {
+            prefetch_buf_.resize(file_size_);
+            fs_.Read(*file_handle_, prefetch_buf_.data(),
+                     static_cast<int64_t>(file_size_), 0);
+        }
+    }
+
+    // Serve from cache if available
+    if (!prefetch_buf_.empty() && offset + length <= prefetch_buf_.size()) {
+        return std::vector<uint8_t>(prefetch_buf_.begin() + offset,
+                                     prefetch_buf_.begin() + offset + length);
+    }
+
+    // Fallback: direct read
     std::vector<uint8_t> buf(length);
     fs_.Read(*file_handle_, buf.data(), static_cast<int64_t>(length), offset);
     return buf;

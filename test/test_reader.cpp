@@ -230,3 +230,31 @@ TEST_CASE("Reader: coalescing works with reversed seqnum order", "[reader][coale
     REQUIRE(cols[1].type.oid == MO_T_int32);   // seqnum 0 = int32
     REQUIRE(cols[2].type.oid == MO_T_varchar);  // seqnum 1 = varchar
 }
+
+// ===================================================================
+// Prefetch (whole-file caching for small files)
+// ===================================================================
+
+TEST_CASE("Reader: prefetch caches entire small file", "[reader][prefetch]") {
+    duckdb::LocalFileSystem fs;
+
+    // With prefetch enabled (default 4 MB) — our test files are ~1-2 KB
+    TAEObjectReader reader(fs, DataPath("basic_3col.tae"));
+    reader.ReadMeta();
+    auto cols = reader.ReadBlock(0, {0, 1, 2});
+    REQUIRE(cols.size() == 3);
+    REQUIRE(cols[0].row_count == 8);
+}
+
+TEST_CASE("Reader: prefetch disabled still works", "[reader][prefetch]") {
+    duckdb::LocalFileSystem fs;
+    TAEObjectReader reader(fs, DataPath("basic_3col.tae"));
+    reader.SetPrefetchThreshold(0); // disable prefetch
+    reader.ReadMeta();
+    auto cols = reader.ReadBlock(0, {0, 1, 2});
+    REQUIRE(cols.size() == 3);
+
+    auto *vals = reinterpret_cast<const int32_t *>(cols[0].data.data());
+    REQUIRE(vals[0] == 10);
+    REQUIRE(vals[7] == 80);
+}

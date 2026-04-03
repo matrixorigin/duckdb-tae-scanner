@@ -196,6 +196,12 @@ public:
     void SetCoalesceGap(uint32_t gap) { coalesce_gap_ = gap; }
     uint32_t GetCoalesceGap() const { return coalesce_gap_; }
 
+    // Prefetch: files ≤ threshold are read entirely on first access.
+    // All subsequent ReadBytes calls are served from cache (zero I/O).
+    // Default 4 MB. Set to 0 to disable prefetch.
+    void SetPrefetchThreshold(uint64_t bytes) { prefetch_threshold_ = bytes; }
+    uint64_t GetPrefetchThreshold() const { return prefetch_threshold_; }
+
 private:
     std::vector<uint8_t> ReadBytes(uint64_t offset, uint64_t length);
     static std::vector<uint8_t> DecompressLZ4(const uint8_t *src, uint32_t src_len,
@@ -214,6 +220,10 @@ private:
     std::vector<uint8_t>                    meta_buf_;
     // Read coalescing gap: merge reads within this many bytes (default 256 KB)
     uint32_t                                coalesce_gap_ = 256 * 1024;
+    // Prefetch: entire file cached if ≤ this size (default 4 MB, 0 = disabled)
+    uint64_t                                prefetch_threshold_ = 4 * 1024 * 1024;
+    bool                                    prefetch_attempted_ = false;
+    std::vector<uint8_t>                    prefetch_buf_;
 };
 
 } // namespace tae
