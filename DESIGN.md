@@ -946,7 +946,7 @@ optimal pipeline utilization.
 
 ## 13. Phased Implementation Plan
 
-### Phase 1: Local Filesystem + Static Schema ✅ Complete
+### 13.1 Local Filesystem + Static Schema ✅ Complete
 
 **Goal:** Run TPC-H queries on GPU via Sirius, reading MO data from local disk.
 
@@ -974,7 +974,7 @@ optimal pipeline utilization.
 - `tae_manifest_gen.py` helper script
 - `test/gen_test_data.py` binary test data generator (~900 lines Python)
 
-### Phase 2: S3 Support + Read Coalescing
+### 13.2 S3 Support + Read Coalescing
 
 **Goal:** Read TAE objects from S3 (production MO deployments).
 
@@ -987,17 +987,289 @@ optimal pipeline utilization.
 `pread()`. DuckDB's httpfs extension handles S3 authentication and range requests
 transparently — any `s3://` path in the manifest works out of the box.
 
-### Phase 3: Live Catalog Integration
+### 13.3 MO-Side Manifest Generation (Query Offload)
 
-**Goal:** Eliminate the manifest file; query MO catalog directly.
+**Goal:** MO generates manifests dynamically from its in-memory catalog when
+offloading analytical queries to the DuckDB/Sirius sidecar.
 
 **Scope:**
-- Connect to MO via SQL to discover table schema and object list
-- Acquire snapshot timestamp for MVCC-consistent reads
-- Dynamic `tae_scan('host:port', 'db', 'table')` interface
-- Support for partitioned tables and views
+- Go serializer in MO that converts catalog state → manifest JSON
+- MVCC-correct: uses transaction snapshot for object visibility
+- Zone maps included from ObjectStats for fast object pruning
+- Tombstones skipped (analytics use case; compacted objects have minimal deletes)
+- Manifest written to tmpfile or passed inline to DuckDB
 
-### Phase 4: Substrait-Based Query Routing (MO → Sirius)
+#### 13.3.1 Why MO Generates the Manifest
+
+Two approaches were considered:
+
+| Approach | Freshness | Consistency | Coupling | Complexity |
+|----------|-----------|-------------|----------|------------|
+| **A: MO serializes in-memory catalog** | Perfect | MVCC snapshot | Tight | Low |
+| **B: Read checkpoint files directly** | Stale (minutes) | Checkpoint-level | Loose | High |
+
+**Approach A is correct for query offloading** — only MO's live catalog can
+guarantee the exact MVCC snapshot. Approach B is useful for offline analytics
+(periodic ETL, reporting) where staleness is acceptable.
+
+#### 13.3.2 MO Catalog APIs
+
+The serializer calls these MO APIs:
+
+```go
+// 1. Get table schema
+schema := tableEntry.GetLastestSchema(false) // false = data objects
+for _, col := range schema.ColDefs {
+    // col.Name, col.Type.Oid, col.Type.Width, col.Type.Scale, col.NullAbility
+}
+
+// 2. Iterate visible objects at transaction snapshot
+it := tableEntry.MakeDataVisibleObjectIt(txn)
+defer it.Release()
+for it.Next() {
+    obj := it.Item()
+    stats := obj.GetObjectStats()
+    // stats.ObjectName().String()  → "uuid_00001"
+    // stats.Rows()                 → row count
+    // stats.BlkCnt()               → block count
+    // stats.Size()                 → compressed size
+    // stats.SortKeyZoneMap()       → 64-byte zone map
+}
+```
+
+Key types:
+- `catalog.TableEntry` → `GetLastestSchema()`, `MakeDataVisibleObjectIt(txn)`
+- `catalog.ObjectEntry` → `GetObjectStats()`, `IsVisible(txn)`
+- `objectio.ObjectStats` (154 bytes) → `ObjectName()`, `Rows()`, `BlkCnt()`, `SortKeyZoneMap()`
+
+#### 13.3.3 ObjectStats Layout (154 bytes)
+
+```
+Offset  Size  Field
+  0      60   object_name  (uuid[16] + filenum[2] + namestring[42])
+ 60      13   extent       (alg[1] + offset[4] + length[4] + origin[4])
+ 73       4   row_cnt
+ 77       4   blk_cnt
+ 81      64   zone_map     (sort key min/max, same format as block zone maps)
+145       4   object_size  (compressed)
+149       4   origin_size  (uncompressed)
+153       1   reserved     (flags: appendable, sorted, cn_created; bits 5-7: level)
+```
+
+The zone map at offset 81 is the **sort key zone map** — same 64-byte format
+used inside `.tae` block metadata. `tae_manifest_gen.py` extracts and
+hex-encodes it into the manifest's `zone_map` field.
+
+#### 13.3.4 Manifest Serializer (Go Pseudocode)
+
+```go
+func GenerateManifest(txn txnif.TxnReader, table *catalog.TableEntry,
+                      dataDir string) ([]byte, error) {
+    schema := table.GetLastestSchema(false)
+
+    // Build column list
+    columns := make([]ManifestColumn, 0, len(schema.ColDefs))
+    var sortColumn string
+    for _, col := range schema.ColDefs {
+        if col.Hidden { continue }
+        columns = append(columns, ManifestColumn{
+            Name:  col.Name,
+            OID:   int(col.Type.Oid),
+            Width: int(col.Type.Width),
+            Scale: int(col.Type.Scale),
+        })
+        if col.IsSortKey() { sortColumn = col.Name }
+    }
+
+    // Enumerate visible objects
+    objects := make([]ManifestObject, 0)
+    it := table.MakeDataVisibleObjectIt(txn)
+    defer it.Release()
+    for it.Next() {
+        stats := it.Item().GetObjectStats()
+        obj := ManifestObject{
+            Path:   stats.ObjectName().String(),
+            Rows:   int(stats.Rows()),
+            Blocks: int(stats.BlkCnt()),
+            Size:   int(stats.Size()),
+        }
+        zm := stats.SortKeyZoneMap()
+        if !zm.IsEmpty() {
+            obj.ZoneMap = hex.EncodeToString(zm[:])
+        }
+        objects = append(objects, obj)
+    }
+
+    manifest := Manifest{
+        Database:   table.GetDB().GetName(),
+        Table:      schema.Name,
+        DataDir:    dataDir,
+        SortColumn: sortColumn,
+        Columns:    columns,
+        Objects:    objects,
+    }
+    return json.Marshal(manifest)
+}
+```
+
+**Properties:**
+- MVCC-correct: `MakeDataVisibleObjectIt(txn)` filters by snapshot
+- Zero I/O: all data from in-memory catalog
+- Latency: microseconds (JSON serialization of ~100s of objects)
+- Tombstone-aware: deleted objects filtered by visibility iterator
+
+#### 13.3.5 Tombstone Handling (Deferred)
+
+MO uses **soft deletes** — tombstone objects (`.tae` files with `object_type=2`)
+record deleted row IDs. Each tombstone row contains:
+
+```
+Col 0: __mo_%1_delete_rowid  (Rowid, 24 bytes = blockid[20] + row_offset[4])
+Col 1: __mo_%1_pk_val        (table PK type)
+Col 2: __mo_%1_commit_time   (TS)
+```
+
+At read time, MO builds a deletion bitmap per block from matching tombstones.
+
+**Current status:** Tombstones are **not handled** by the DuckDB scanner.
+For analytics workloads on compacted data, this is acceptable — compaction
+merges data and applies tombstones, producing clean objects with no deletes.
+
+**Future options:**
+1. MO pre-computes deletion bitmaps and includes them in the manifest
+2. Scanner reads tombstone objects and applies filtering itself
+3. MO only offloads queries on fully-compacted tables
+
+#### 13.3.6 End-to-End Offload Flow
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ User: SELECT ... FROM lineitem WHERE l_shipdate > '1995' │
+└──────────────────────┬───────────────────────────────────┘
+                       │
+                       ▼
+┌──────────────────────────────────┐
+│ MO Optimizer                     │
+│ • Decides to offload to sidecar  │
+│ • Calls GenerateManifest(txn)    │
+│ • Writes /tmp/manifest_xxx.json  │
+└──────────────────────┬───────────┘
+                       │
+                       ▼
+┌──────────────────────────────────────────────────────────┐
+│ DuckDB Sidecar                                           │
+│ SELECT * FROM tae_scan('/tmp/manifest_xxx.json')         │
+│   WHERE l_shipdate > '1995-01-01'                        │
+│                                                          │
+│ • Reads manifest → discovers 50 objects                  │
+│ • Zone map fast path → skips 30 objects (no ReadMeta)    │
+│ • Block-level pruning → skips 15 more blocks             │
+│ • Scans 5 objects, returns results                       │
+└──────────────────────┬───────────────────────────────────┘
+                       │
+                       ▼
+┌──────────────────────────────────┐
+│ MO Frontend                      │
+│ • Returns results to client      │
+└──────────────────────────────────┘
+```
+
+#### 13.3.7 Manifest Generation Tools
+
+| Tool | Use Case | Data Source |
+|------|----------|-------------|
+| `tae_manifest_gen.py` | Dev/testing, offline analytics | MO via MySQL (`mo_ctl inspect`) |
+| Go serializer (planned) | Production query offload | MO in-memory catalog |
+| Checkpoint reader (future) | Offline analytics, MO is down | `.ckp` files on shared storage |
+
+#### 13.3.8 Approach B: Checkpoint File Reader (Offline Analytics)
+
+For use cases where MO is unavailable or staleness is acceptable (periodic ETL,
+reporting dashboards, backup verification), a standalone tool can generate
+manifests by reading checkpoint files directly from shared storage.
+
+**Checkpoint file structure:**
+
+```
+ckp/
+├── meta_<start_ts>_<end_ts>.ckp    # Checkpoint metadata
+└── <data_objects>.ckp               # Checkpoint data batches
+```
+
+Checkpoint metadata contains a **TableRange** batch with columns:
+
+```
+Col 0: table_id     (uint64)
+Col 1: object_type  (int8: 1=Data, 2=Tombstone)
+Col 2: start_rowid  (Rowid)
+Col 3: end_rowid    (Rowid)
+Col 4: objectStats  (bytes, 154-byte ObjectStats)
+```
+
+Each row represents one object. The `objectStats` field is the same 154-byte
+binary structure described in §13.3.3, containing the object name, row/block
+counts, zone map, and sizes.
+
+**Reading algorithm:**
+
+```go
+func GenerateManifestFromCheckpoint(ckpPath string, tableID uint64,
+                                     dataDir string) ([]byte, error) {
+    // 1. List checkpoint metadata files
+    metaFiles := ckputil.ListCKPMetaFiles(ckpPath)
+    latestMeta := metaFiles[len(metaFiles)-1]
+
+    // 2. Read metadata batch
+    metaBatch := ckputil.ReadMetaBatch(latestMeta)
+
+    // 3. Filter for target table's data objects
+    ranges := ckputil.ExportToTableRangesByFilter(
+        metaBatch, tableID, ObjectType_Data)
+
+    // 4. Extract ObjectStats from each range
+    objects := make([]ManifestObject, 0)
+    for _, r := range ranges {
+        stats := r.ObjectStats
+        obj := ManifestObject{
+            Path:   stats.ObjectName().String(),
+            Rows:   int(stats.Rows()),
+            Blocks: int(stats.BlkCnt()),
+            Size:   int(stats.Size()),
+        }
+        zm := stats.SortKeyZoneMap()
+        if !zm.IsEmpty() {
+            obj.ZoneMap = hex.EncodeToString(zm[:])
+        }
+        objects = append(objects, obj)
+    }
+
+    // 5. Schema must be obtained separately (not in checkpoint)
+    //    Options: hardcode, read from MO SQL, or embed in a config file
+    ...
+}
+```
+
+**Challenges vs Approach A:**
+
+| Challenge | Detail |
+|-----------|--------|
+| **Schema not in checkpoint** | Checkpoint stores ObjectStats but not column names/types. Schema must come from MO SQL, a config file, or the `COLUMNS_META` system table in checkpoint |
+| **Incremental checkpoints** | MO produces incremental checkpoints; the reader must merge global + incremental to get the full object list |
+| **MVCC filtering** | Checkpoint objects have `create_ts` and `delete_ts`; the reader must apply timestamp filtering to get a consistent view |
+| **Table ID discovery** | Must know the numeric `table_id`; requires either MO SQL or scanning the checkpoint's catalog tables |
+| **Format versioning** | Checkpoint format changes across MO versions (currently `CheckpointVersion13`); reader must track format evolution |
+
+**When to use Approach B:**
+- MO is offline for maintenance and analytics must continue
+- Data lake export: periodic snapshot of MO tables for external tools
+- Backup verification: confirm checkpoint data is readable
+- Development: generate manifests without running MO
+
+**When NOT to use:**
+- Real-time query offloading (use Approach A — need MVCC consistency)
+- Tables with active deletes (tombstones require transaction context)
+
+### 13.4 Substrait-Based Query Routing (MO → Sirius)
 
 **Goal:** MO offloads analytical queries to Sirius automatically via Substrait plans.
 
@@ -1515,10 +1787,10 @@ phases the *MO↔Sirius integration* — they run in parallel:
 
 | §13 Extension Phase | §17 Integration Step | Combined Effect |
 |---------------------|---------------------|-----------------|
-| Phase 1: Local scan | Step 1: Path 1 (CLI) | Manual DuckDB queries on local TAE files |
-| Phase 2: S3 support | Step 2: Path 2 (SQL) | MO auto-routes queries, sidecar reads S3 |
-| Phase 3: Live catalog | Step 2 continues | No manifest needed, live schema from MO |
-| Phase 4: Substrait | Step 3: Path 3 | Full plan pushdown, MO optimizer preserved |
+| §13.1: Local scan | Step 1: Path 1 (CLI) | Manual DuckDB queries on local TAE files |
+| §13.2: S3 support | Step 2: Path 2 (SQL) | MO auto-routes queries, sidecar reads S3 |
+| §13.3: MO manifest gen | Step 2 continues | MO generates manifest from live catalog |
+| §13.4: Substrait | Step 3: Path 3 | Full plan pushdown, MO optimizer preserved |
 
 **Step 1 (Current):** Path 1 only. tae_scan extension + manifest generator.
 User manually calls `gpu_execution('SELECT ... FROM tae_scan(...)')` from DuckDB CLI.
