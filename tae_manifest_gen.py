@@ -139,6 +139,8 @@ NAME_STRING_LEN = 42
 EXTENT_LEN = 13
 ROW_CNT_OFFSET = 73
 BLK_CNT_OFFSET = 77
+ZONE_MAP_OFFSET = 81
+ZONE_MAP_LEN = 64
 OBJ_SIZE_OFFSET = 145
 OBJ_ORIGIN_SIZE_OFFSET = 149
 OBJECT_STATS_LEN = 154
@@ -166,13 +168,21 @@ def decode_object_stats(b64_str: str) -> dict:
     # Original size: uint32 LE at offset 149
     origin_size = struct.unpack_from("<I", raw, OBJ_ORIGIN_SIZE_OFFSET)[0]
 
-    return {
+    # Sort key zone map: 64 bytes at offset 81 (hex-encoded for manifest)
+    zm_bytes = raw[ZONE_MAP_OFFSET : ZONE_MAP_OFFSET + ZONE_MAP_LEN]
+    # All-zero zone map means no zone map data (object has no sort key or wasn't compacted)
+    zone_map_hex = zm_bytes.hex() if any(b != 0 for b in zm_bytes) else ""
+
+    result = {
         "path": obj_name,
         "rows": row_cnt,
         "blocks": blk_cnt,
         "size": size,
         "origin_size": origin_size,
     }
+    if zone_map_hex:
+        result["zone_map"] = zone_map_hex
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +303,7 @@ def main():
     parser.add_argument("--db", required=True, help="Database name")
     parser.add_argument("--table", required=True, help="Table name")
     parser.add_argument("--data-dir", required=True, help="MO shared fileservice root (e.g. mo-data/shared)")
+    parser.add_argument("--sort-column", default=None, help="Sort key column name (enables zone_map fast path)")
     parser.add_argument("--output", "-o", required=True, help="Output manifest JSON path")
     parser.add_argument("--flush", action="store_true", help="Flush table before generating manifest")
     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output")
@@ -322,23 +333,33 @@ def main():
             "database": args.db,
             "table": args.table,
             "data_dir": str(Path(args.data_dir).resolve()),
-            "columns": [
-                {
-                    "name": c["name"],
-                    "type_str": c["type_str"],
-                    "oid": c["oid"],
-                    "width": c["width"],
-                    "scale": c["scale"],
-                    "nullable": c["nullable"],
-                }
-                for c in columns
-            ],
-            "objects": objects,
-            "stats": {
-                "total_rows": total_rows,
-                "total_objects": len(objects),
-                "total_origin_size": total_size,
-            },
+        }
+        if args.sort_column:
+            # Validate sort_column exists in schema
+            col_names = [c["name"] for c in columns]
+            if args.sort_column not in col_names:
+                print(f"Warning: --sort-column '{args.sort_column}' not found in table columns: {col_names}",
+                      file=sys.stderr)
+            manifest["sort_column"] = args.sort_column
+            # Count objects with zone maps
+            zm_count = sum(1 for o in objects if "zone_map" in o)
+            print(f"  {zm_count}/{len(objects)} objects have zone maps", file=sys.stderr)
+        manifest["columns"] = [
+            {
+                "name": c["name"],
+                "type_str": c["type_str"],
+                "oid": c["oid"],
+                "width": c["width"],
+                "scale": c["scale"],
+                "nullable": c["nullable"],
+            }
+            for c in columns
+        ]
+        manifest["objects"] = objects
+        manifest["stats"] = {
+            "total_rows": total_rows,
+            "total_objects": len(objects),
+            "total_origin_size": total_size,
         }
 
         output_path = Path(args.output)

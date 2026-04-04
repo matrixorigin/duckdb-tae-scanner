@@ -1020,6 +1020,40 @@ def main():
     with open(mf_path, 'w') as f:
         json.dump(multifile_manifest, f, indent=2)
 
+    # Multi-file manifest WITH object-level zone maps for the sort key (col_int)
+    # basic_3col: col_int [10..80], part2: col_int [100..400]
+    zm_basic = build_zone_map_numeric(MO_T_INT32, 10, 80, 4).hex()
+    zm_part2 = build_zone_map_numeric(MO_T_INT32, 100, 400, 4).hex()
+    multifile_zm_manifest = {
+        'database': 'test_db',
+        'table': 'test_multifile_zm',
+        'sort_column': 'col_int',
+        'columns': [
+            {'name': 'col_int', 'oid': MO_T_INT32},
+            {'name': 'col_str', 'oid': MO_T_VARCHAR},
+            {'name': 'col_dbl', 'oid': MO_T_FLOAT64},
+        ],
+        'objects': [
+            {
+                'path': os.path.basename(basic_path),
+                'rows': 8,
+                'blocks': 1,
+                'size': os.path.getsize(basic_path),
+                'zone_map': zm_basic,
+            },
+            {
+                'path': os.path.basename(part2_path),
+                'rows': 4,
+                'blocks': 1,
+                'size': os.path.getsize(part2_path),
+                'zone_map': zm_part2,
+            },
+        ],
+    }
+    mf_zm_path = os.path.join(outdir, 'manifest_multifile_zm.json')
+    with open(mf_zm_path, 'w') as f:
+        json.dump(multifile_zm_manifest, f, indent=2)
+
     # Constant vector manifest
     const_manifest = {
         'database': 'test_db',
@@ -1143,6 +1177,7 @@ def main():
     print(f'  {os.path.basename(lz4_path)}  ({os.path.getsize(lz4_path)} bytes, LZ4)')
     print(f'  manifest.json')
     print(f'  manifest_multifile.json')
+    print(f'  manifest_multifile_zm.json')
     print(f'  manifest_constants.json')
     print(f'  manifest_types.json')
     print(f'  manifest_datetime.json')

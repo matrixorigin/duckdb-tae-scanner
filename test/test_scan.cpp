@@ -1005,6 +1005,39 @@ TEST_CASE("Partition prune: filter skips all objects", "[partition_prune]") {
     CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 0);
 }
 
+TEST_CASE("Partition prune: manifest zone_map fast path skips object", "[partition_prune]") {
+    auto db = MakeDB();
+    // Uses manifest_multifile_zm.json which has sort_key zone maps.
+    // Filter col_int > 90: first object zm [10..80] fails → skipped via fast path (no ReadMeta)
+    auto result = Query(*db,
+        "SELECT col_int FROM tae_scan('" +
+        ManifestPath("manifest_multifile_zm.json") + "') WHERE col_int > 90 ORDER BY col_int");
+    REQUIRE_FALSE(result->HasError());
+    CHECK(result->RowCount() == 4);
+    CHECK(result->GetValue(0, 0).GetValue<int32_t>() == 100);
+    CHECK(result->GetValue(0, 3).GetValue<int32_t>() == 400);
+}
+
+TEST_CASE("Partition prune: manifest zone_map passes all objects", "[partition_prune]") {
+    auto db = MakeDB();
+    // Filter col_int > 5: both objects pass (zm min 10 and 100 both > 5)
+    auto result = Query(*db,
+        "SELECT COUNT(*) FROM tae_scan('" +
+        ManifestPath("manifest_multifile_zm.json") + "') WHERE col_int > 5");
+    REQUIRE_FALSE(result->HasError());
+    CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 12);
+}
+
+TEST_CASE("Partition prune: manifest zone_map skips all objects", "[partition_prune]") {
+    auto db = MakeDB();
+    // Filter col_int > 9999: both zms fail
+    auto result = Query(*db,
+        "SELECT COUNT(*) FROM tae_scan('" +
+        ManifestPath("manifest_multifile_zm.json") + "') WHERE col_int > 9999");
+    REQUIRE_FALSE(result->HasError());
+    CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 0);
+}
+
 // ===================================================================
 // Negative / error tests
 // ===================================================================

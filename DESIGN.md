@@ -559,7 +559,7 @@ duckdb_tae_scanner/
 │   └── tae_scanner_extension.cpp     Extension entry point
 └── test/
     ├── gen_test_data.py              Python TAE binary writer (test fixtures)
-    ├── test_scan.cpp                 Catch2 end-to-end tests (98 tests)
+    ├── test_scan.cpp                 Catch2 end-to-end tests (107 tests)
     └── data/                         Generated .tae files + manifest JSONs
 ```
 
@@ -773,6 +773,31 @@ This provides two levels of pruning:
 1. **Object-level** (Init time): Entire objects skipped when all blocks fail
 2. **Block-level** (Execute time): Remaining blocks re-checked at scan time
 
+#### Manifest Zone Map Fast Path
+
+When the manifest includes a `zone_map` hex field and `sort_column` name, the
+scanner can prune objects **without reading metadata at all**. The zone map
+encodes the sort key's min/max values in the same 64-byte format used inside
+.tae files.
+
+```json
+{
+  "sort_column": "col_int",
+  "objects": [
+    {"path": "obj1.tae", "zone_map": "0a000000...50000000...", ...}
+  ]
+}
+```
+
+During Init, if an object has `sort_key_zm` and the filters reference the sort
+column, `ZoneMapPassesFilters()` evaluates the manifest zone map directly:
+
+- **Fail** → skip the object entirely (no ReadMeta, no I/O)
+- **Pass** → proceed to per-block pruning as usual
+
+This is especially valuable for remote/S3 files where ReadMeta requires a
+network round-trip per object.
+
 The `objects_skipped` counter appears in `DynamicToString` profiling output
 when any objects are pruned. Combined with `blocks_skipped`, this gives
 complete visibility into how much I/O was avoided.
@@ -942,7 +967,7 @@ optimal pipeline utilization.
 - ✅ EXPLAIN integration (toString, dynamicToString)
 - ✅ Progress reporting
 - ✅ LZ4 decompression
-- ✅ 98 Catch2 tests, 490 assertions
+- ✅ 107 Catch2 tests, 529 assertions
 
 **Deliverables:**
 - `tae_scanner.so` DuckDB extension (~1,100 lines C++)
@@ -1017,7 +1042,7 @@ make -j$(nproc) tae_tests
 cd duckdb_tae_scanner
 python3 test/gen_test_data.py
 
-# Run all 98 tests
+# Run all 107 tests
 cd build && ./test/tae_tests
 
 # Run specific test tags

@@ -35,6 +35,9 @@ struct TAEObjectInfo {
     uint32_t    rows;
     uint32_t    blocks;
     uint32_t    size_bytes;
+    // Optional: object-level zone map for the sort key column (64 bytes).
+    // If present, enables fast object pruning without reading metadata.
+    std::vector<uint8_t> sort_key_zm;  // empty = not available
 };
 
 // ---------------------------------------------------------------------------

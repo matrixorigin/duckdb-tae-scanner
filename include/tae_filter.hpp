@@ -39,4 +39,9 @@ duckdb::Value ZoneMapBytesToValue(const uint8_t *ptr, MOTypeOid oid,
 // Decode a string zone-map value (first 32 bytes = varlena-style prefix).
 std::string ZoneMapBytesToString(const uint8_t *ptr);
 
+// Check if a raw 64-byte zone map passes a set of filters for a specific seqnum.
+// Used for object-level sort key zone maps (not tied to a reader).
+bool ZoneMapPassesFilters(const std::vector<PushedFilter> &filters,
+                          const uint8_t *zm_data, uint16_t target_seqnum);
+
 } // namespace tae

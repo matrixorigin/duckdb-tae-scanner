@@ -39,6 +39,25 @@ using namespace duckdb_yyjson; // NOLINT
 
 namespace tae {
 
+// Decode hex string to bytes. Returns empty vector on invalid input.
+static std::vector<uint8_t> HexDecode(const char *hex, size_t len) {
+    if (len % 2 != 0) return {};
+    std::vector<uint8_t> out(len / 2);
+    for (size_t i = 0; i < len; i += 2) {
+        auto hi = hex[i], lo = hex[i + 1];
+        auto nibble = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+        int h = nibble(hi), l = nibble(lo);
+        if (h < 0 || l < 0) return {};
+        out[i / 2] = static_cast<uint8_t>((h << 4) | l);
+    }
+    return out;
+}
+
 // ===================================================================
 // Manifest JSON parsing
 // ===================================================================
@@ -104,6 +123,16 @@ static void ParseManifest(const std::string &manifest_path,
         info.blocks     = static_cast<uint32_t>(yyjson_get_int(yyjson_obj_get(obj_val, "blocks")));
         auto *sz = yyjson_obj_get(obj_val, "size");
         info.size_bytes = sz ? static_cast<uint32_t>(yyjson_get_int(sz)) : 0;
+        // Optional: hex-encoded 64-byte zone map for the sort key column
+        auto *zm_val = yyjson_obj_get(obj_val, "zone_map");
+        if (zm_val && yyjson_is_str(zm_val)) {
+            auto zm_hex = yyjson_get_str(zm_val);
+            auto zm_len = yyjson_get_len(zm_val);
+            auto zm_bytes = HexDecode(zm_hex, zm_len);
+            if (zm_bytes.size() == 64) {
+                info.sort_key_zm = std::move(zm_bytes);
+            }
+        }
         bind.objects.push_back(std::move(info));
     }
 
@@ -264,13 +293,32 @@ TAEScanInit(duckdb::ClientContext &context,
     // Build flattened work queue with object-level pruning.
     // When filters are present, read each object's metadata and check zone maps
     // for all blocks. Objects where ALL blocks fail filters are skipped entirely.
+    //
+    // Fast path: if an object has a sort_key_zm (from manifest), check it first.
+    // If the sort key zone map alone eliminates the object, skip without ReadMeta().
     if (!state->filters.empty()) {
         auto &fs = duckdb::FileSystem::GetFileSystem(context);
+        uint16_t sort_seqnum = (bind.sort_column_idx >= 0)
+            ? static_cast<uint16_t>(bind.sort_column_idx) : UINT16_MAX;
+
         for (uint32_t obj = 0; obj < bind.objects.size(); obj++) {
+            auto &obj_info = bind.objects[obj];
+
+            // Fast path: object-level sort key zone map from manifest
+            if (!obj_info.sort_key_zm.empty() && sort_seqnum != UINT16_MAX) {
+                if (!ZoneMapPassesFilters(state->filters, obj_info.sort_key_zm.data(),
+                                           sort_seqnum)) {
+                    // Sort key filter eliminates entire object — no metadata read needed
+                    state->blocks_skipped.fetch_add(obj_info.blocks, std::memory_order_relaxed);
+                    state->objects_skipped.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+            }
+
+            // Slow path: read per-block metadata and check all filters
             bool any_block_passes = false;
             try {
-                auto path = std::filesystem::path(bind.data_dir) /
-                            bind.objects[obj].file_path;
+                auto path = std::filesystem::path(bind.data_dir) / obj_info.file_path;
                 TAEObjectReader reader(fs, path.string());
                 reader.ReadMeta();
                 for (uint32_t blk = 0; blk < reader.BlockCount(); blk++) {
@@ -282,8 +330,7 @@ TAEScanInit(duckdb::ClientContext &context,
                     }
                 }
             } catch (...) {
-                // Can't read metadata — include all blocks (conservative)
-                for (uint32_t blk = 0; blk < bind.objects[obj].blocks; blk++) {
+                for (uint32_t blk = 0; blk < obj_info.blocks; blk++) {
                     state->work_units.push_back({obj, blk});
                 }
                 any_block_passes = true;

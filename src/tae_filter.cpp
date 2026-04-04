@@ -227,6 +227,16 @@ bool BlockPassesFilters(const std::vector<PushedFilter> &filters,
     return true;
 }
 
+bool ZoneMapPassesFilters(const std::vector<PushedFilter> &filters,
+                           const uint8_t *zm_data, uint16_t target_seqnum) {
+    if (!zm_data) return true;
+    for (auto &f : filters) {
+        if (f.seqnum != target_seqnum) continue;
+        if (!EvalFilterOnZoneMap(f, zm_data)) return false;
+    }
+    return true;
+}
+
 // ===================================================================
 // Per-row filter evaluation
 // ===================================================================
