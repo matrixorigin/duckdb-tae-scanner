@@ -910,7 +910,7 @@ optimal pipeline utilization.
 - ✅ EXPLAIN integration (toString, dynamicToString)
 - ✅ Progress reporting
 - ✅ LZ4 decompression
-- ✅ 89 Catch2 tests, 472 assertions
+- ✅ 95 Catch2 tests, 480 assertions
 
 **Deliverables:**
 - `tae_scanner.so` DuckDB extension (~1,100 lines C++)
