@@ -889,6 +889,45 @@ TEST_CASE("Stats: multifile min/max merge", "[stats]") {
 }
 
 // ===================================================================
+// Object-level partition pruning tests
+// ===================================================================
+
+TEST_CASE("Partition prune: filter skips entire object via zone maps", "[partition_prune]") {
+    auto db = MakeDB();
+    // multifile: basic_3col has col_int [10..80], part2 has [100..400]
+    // Filter col_int > 90 should skip the first object entirely
+    auto result = Query(*db,
+        "SELECT col_int FROM tae_scan('" +
+        ManifestPath("manifest_multifile.json") + "') WHERE col_int > 90 ORDER BY col_int");
+    REQUIRE_FALSE(result->HasError());
+    CHECK(result->RowCount() == 4);
+    CHECK(result->GetValue(0, 0).GetValue<int32_t>() == 100);
+    CHECK(result->GetValue(0, 1).GetValue<int32_t>() == 200);
+    CHECK(result->GetValue(0, 2).GetValue<int32_t>() == 300);
+    CHECK(result->GetValue(0, 3).GetValue<int32_t>() == 400);
+}
+
+TEST_CASE("Partition prune: filter passes all objects", "[partition_prune]") {
+    auto db = MakeDB();
+    // Filter col_int > 0 should pass both objects (min 10 in first, 100 in second)
+    auto result = Query(*db,
+        "SELECT COUNT(*) FROM tae_scan('" +
+        ManifestPath("manifest_multifile.json") + "') WHERE col_int > 0");
+    REQUIRE_FALSE(result->HasError());
+    CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 12);
+}
+
+TEST_CASE("Partition prune: filter skips all objects", "[partition_prune]") {
+    auto db = MakeDB();
+    // Filter col_int > 9999 should skip both objects (max 80 and 400)
+    auto result = Query(*db,
+        "SELECT COUNT(*) FROM tae_scan('" +
+        ManifestPath("manifest_multifile.json") + "') WHERE col_int > 9999");
+    REQUIRE_FALSE(result->HasError());
+    CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 0);
+}
+
+// ===================================================================
 // Negative / error tests
 // ===================================================================
 

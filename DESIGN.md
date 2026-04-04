@@ -559,7 +559,7 @@ duckdb_tae_scanner/
 │   └── tae_scanner_extension.cpp     Extension entry point
 └── test/
     ├── gen_test_data.py              Python TAE binary writer (test fixtures)
-    ├── test_scan.cpp                 Catch2 end-to-end tests (95 tests)
+    ├── test_scan.cpp                 Catch2 end-to-end tests (98 tests)
     └── data/                         Generated .tae files + manifest JSONs
 ```
 
@@ -745,6 +745,38 @@ while (current_block < block_count) {
 The scanner tracks `blocks_scanned` and `blocks_skipped` counters for
 diagnostic logging. A high skip ratio indicates effective pushdown.
 
+### 8.5 Object-Level Partition Pruning
+
+When filters are present, the scanner evaluates zone maps for **all blocks** of
+each object at Init time, before building the work queue. If every block in an
+object fails the zone map check, the entire object is excluded from the work
+queue — no blocks are read and no I/O occurs for that object.
+
+```cpp
+// In TAEScanInit() — work queue build:
+if (!state->filters.empty()) {
+    for each object:
+        reader.ReadMeta();
+        for each block in object:
+            if (BlockPassesFilters(...))
+                add to work queue;
+            else
+                blocks_skipped++;
+        if (no block added)
+            objects_skipped++;
+} else {
+    // No filters — add all blocks unconditionally
+}
+```
+
+This provides two levels of pruning:
+1. **Object-level** (Init time): Entire objects skipped when all blocks fail
+2. **Block-level** (Execute time): Remaining blocks re-checked at scan time
+
+The `objects_skipped` counter appears in `DynamicToString` profiling output
+when any objects are pruned. Combined with `blocks_skipped`, this gives
+complete visibility into how much I/O was avoided.
+
 ---
 
 ## 9. ORDER BY Pushdown (Scan Order Optimization)
@@ -910,7 +942,7 @@ optimal pipeline utilization.
 - ✅ EXPLAIN integration (toString, dynamicToString)
 - ✅ Progress reporting
 - ✅ LZ4 decompression
-- ✅ 95 Catch2 tests, 480 assertions
+- ✅ 98 Catch2 tests, 490 assertions
 
 **Deliverables:**
 - `tae_scanner.so` DuckDB extension (~1,100 lines C++)
@@ -985,7 +1017,7 @@ make -j$(nproc) tae_tests
 cd duckdb_tae_scanner
 python3 test/gen_test_data.py
 
-# Run all 95 tests
+# Run all 98 tests
 cd build && ./test/tae_tests
 
 # Run specific test tags

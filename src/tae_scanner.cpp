@@ -261,10 +261,42 @@ TAEScanInit(duckdb::ClientContext &context,
         state->do_sample = state->sample_rate < 1.0;
     }
 
-    // Build flattened work queue: all (object_idx, block_idx) pairs
-    for (uint32_t obj = 0; obj < bind.objects.size(); obj++) {
-        for (uint32_t blk = 0; blk < bind.objects[obj].blocks; blk++) {
-            state->work_units.push_back({obj, blk});
+    // Build flattened work queue with object-level pruning.
+    // When filters are present, read each object's metadata and check zone maps
+    // for all blocks. Objects where ALL blocks fail filters are skipped entirely.
+    if (!state->filters.empty()) {
+        auto &fs = duckdb::FileSystem::GetFileSystem(context);
+        for (uint32_t obj = 0; obj < bind.objects.size(); obj++) {
+            bool any_block_passes = false;
+            try {
+                auto path = std::filesystem::path(bind.data_dir) /
+                            bind.objects[obj].file_path;
+                TAEObjectReader reader(fs, path.string());
+                reader.ReadMeta();
+                for (uint32_t blk = 0; blk < reader.BlockCount(); blk++) {
+                    if (BlockPassesFilters(state->filters, reader, blk)) {
+                        state->work_units.push_back({obj, blk});
+                        any_block_passes = true;
+                    } else {
+                        state->blocks_skipped.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            } catch (...) {
+                // Can't read metadata — include all blocks (conservative)
+                for (uint32_t blk = 0; blk < bind.objects[obj].blocks; blk++) {
+                    state->work_units.push_back({obj, blk});
+                }
+                any_block_passes = true;
+            }
+            if (!any_block_passes) {
+                state->objects_skipped.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    } else {
+        for (uint32_t obj = 0; obj < bind.objects.size(); obj++) {
+            for (uint32_t blk = 0; blk < bind.objects[obj].blocks; blk++) {
+                state->work_units.push_back({obj, blk});
+            }
         }
     }
 
@@ -646,6 +678,10 @@ TAEScanDynamicToString(duckdb::TableFunctionDynamicToStringInput &input) {
 
     result["Blocks Scanned"] = std::to_string(state.blocks_scanned.load(std::memory_order_relaxed));
     result["Blocks Skipped"] = std::to_string(state.blocks_skipped.load(std::memory_order_relaxed));
+    auto obj_skip = state.objects_skipped.load(std::memory_order_relaxed);
+    if (obj_skip > 0) {
+        result["Objects Skipped"] = std::to_string(obj_skip);
+    }
     result["Rows Emitted"] = std::to_string(state.rows_emitted.load(std::memory_order_relaxed));
     return result;
 }

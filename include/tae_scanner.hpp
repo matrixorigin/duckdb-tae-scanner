@@ -127,6 +127,7 @@ struct TAEScanState : public duckdb::GlobalTableFunctionState {
     // Statistics / progress (atomics for thread safety)
     std::atomic<uint64_t>          blocks_scanned{0};
     std::atomic<uint64_t>          blocks_skipped{0};
+    std::atomic<uint64_t>          objects_skipped{0};
     std::atomic<uint64_t>          rows_emitted{0};
 
     duckdb::idx_t MaxThreads() const override {
