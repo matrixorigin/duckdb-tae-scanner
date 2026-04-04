@@ -354,8 +354,8 @@ TAEScanInit(duckdb::ClientContext &context,
             } else {
                 std::sort(sortable.begin(), sortable.end(),
                     [](const SortableUnit &a, const SortableUnit &b) {
-                        if (a.key.IsNull()) return true;
-                        if (b.key.IsNull()) return false;
+                        if (a.key.IsNull()) return false;
+                        if (b.key.IsNull()) return true;
                         return a.key > b.key;
                     });
             }

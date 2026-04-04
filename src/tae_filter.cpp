@@ -386,12 +386,12 @@ duckdb::Value ZoneMapBytesToValue(const uint8_t *ptr, MOTypeOid oid,
     case MO_T_bool:      { return duckdb::Value::BOOLEAN(ptr[0] != 0); }
     case MO_T_date: {
         int32_t v; memcpy(&v, ptr, sizeof(v));
-        return duckdb::Value::DATE(duckdb::Date::EpochDaysToDate(v));
+        return duckdb::Value::DATE(duckdb::Date::EpochDaysToDate(v - MO_UNIX_EPOCH_DAYS));
     }
     case MO_T_datetime:
     case MO_T_timestamp: {
         int64_t v; memcpy(&v, ptr, sizeof(v));
-        return duckdb::Value::TIMESTAMP(duckdb::Timestamp::FromEpochMicroSeconds(v));
+        return duckdb::Value::TIMESTAMP(duckdb::Timestamp::FromEpochMicroSeconds(v - MO_UNIX_EPOCH_USEC));
     }
     case MO_T_decimal64: {
         int64_t v; memcpy(&v, ptr, sizeof(v));
