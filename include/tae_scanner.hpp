@@ -101,8 +101,9 @@ struct TAEScanBindData : public duckdb::TableFunctionData {
 // Describes what each output column slot holds
 struct OutputColumnInfo {
     enum Kind { TAE_COLUMN, VCOL_FILENAME, VCOL_BLOCK_ID };
-    Kind         kind;
-    duckdb::idx_t tae_col_idx; // only valid for TAE_COLUMN
+    Kind          kind;
+    duckdb::idx_t tae_col_idx;  // original table column index (TAE_COLUMN only)
+    duckdb::idx_t decoded_pos;  // position in decoded_cols array (TAE_COLUMN only)
 };
 
 struct TAEScanState : public duckdb::GlobalTableFunctionState {

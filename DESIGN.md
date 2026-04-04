@@ -488,12 +488,22 @@ WHERE l_shipdate >= DATE '1994-01-01'
 
 #### Phase 2: Init
 
-- Build `output_map` classifying each output column as TAE_COLUMN or virtual
-  (VCOL_FILENAME, VCOL_BLOCK_ID)
-- Extract pushed-down filters and encode constants in MO binary format
-- Read sampling options (`TABLESAMPLE SYSTEM`)
-- Build flattened work queue of `(object_idx, block_idx)` pairs
-- Create per-thread local state (RNG for sampling)
+Init processes the column list in three phases to correctly handle DuckDB's
+`filter_prune` optimization (where filter-only columns are excluded from output):
+
+1. **Phase 1 — Read columns**: Iterate `input.column_ids` (includes ALL columns:
+   projected + filter-only). For each TAE column, append its seqnum to `read_seqnums`
+   and record `col_ids_to_decoded[ci]` = position in `decoded_cols`.
+
+2. **Phase 2 — Output map**: Build `output_map` from `input.projection_ids`
+   (or `column_ids` if absent). Each entry stores a `decoded_pos` for direct
+   indexing into `decoded_cols` — no sequential counter needed.
+
+3. **Phase 3 — Filters**: Extract pushed-down filters using `col_ids_to_decoded`
+   to map filter column indices to decoded_cols positions. Encode constants in
+   MO binary format.
+
+Also: read sampling options, build work queue, create per-thread local state.
 
 #### Phase 3: Execute (parallel, called repeatedly until EOF)
 
@@ -507,12 +517,14 @@ for each pushed filter:
     if zone_map_eliminates(block, filter):
         blocks_skipped++; continue to next work unit
 
-decoded_cols = reader.ReadBlock(block_idx, projected_seqnums)
+decoded_cols = reader.ReadBlock(block_idx, read_seqnums)
 
 // Fill output columns via output_map:
-//   TAE_COLUMN  → FillColumn (handles FLAT + CONSTANT vectors)
+//   TAE_COLUMN  → FillColumn(output[i], decoded_cols[om.decoded_pos])
 //   VCOL_FILENAME → fill_n with file path string
 //   VCOL_BLOCK_ID → fill_n with block index
+// (output_map.size() == DataChunk columns; decoded_cols may be larger
+//  when filter_prune adds filter-only columns to read_seqnums)
 
 // Per-row filter evaluation
 filtered_count = ApplyRowFilters(filters, decoded_cols, output)
@@ -599,7 +611,7 @@ These are populated in the Execute phase via `fill_n` on flat vectors.
 | `TAEScanInitLocal` | Per-thread state (reader cache, RNG) |
 | `TAEScanExecute` | Parallel block scan with atomic dispatch |
 | `TAEScanCardinality` | Row count estimate for planner |
-| `TAEScanStatistics` | Column min/max from zone maps |
+| `TAEScanStatistics` | Column min/max + null info from zone maps & metadata |
 | `TAEScanProgress` | Scan completion percentage |
 | `TAEScanToString` | Static EXPLAIN info |
 | `TAEScanDynamicToString` | Runtime profiling info |
@@ -691,14 +703,32 @@ the block, it is skipped.
 ```cpp
 // In GetTAEScanFunction():
 func.filter_pushdown = true;   // tell DuckDB to push filters to us
-func.filter_prune = true;      // allow pruning filter-only columns
+func.filter_prune = true;      // allow pruning filter-only columns from output
+```
 
+**filter_prune column mapping**: When `filter_prune = true`, DuckDB's
+`RemoveUnusedColumns` optimizer keeps filter-only columns in `column_ids` but
+excludes them from the output via `projection_ids`:
+
+```
+Example: SELECT col_int, col_dbl FROM ... WHERE col_str = 'x'
+
+column_ids     = [0, 1, 2]   // col_int, col_str (filter-only), col_dbl
+projection_ids = [0, 2]      // output slots → positions 0 and 2 in column_ids
+```
+
+The scanner reads ALL `column_ids` columns into `decoded_cols` (for both output
+and filtering), but builds `output_map` from `projection_ids` only. Each
+`OutputColumnInfo` stores a `decoded_pos` so Execute can directly index
+`decoded_cols[om.decoded_pos]` without a fragile sequential counter.
+
+```cpp
 // In TAEScanInit():
 for (auto &entry : *input.filters) {
-    ProjectionIndex col_idx = entry.GetIndex();
-    const TableFilter &filter = entry.Filter();
+    ProjectionIndex col_idx = entry.GetIndex();  // position in column_ids
+    auto decoded_pos = col_ids_to_decoded[col_idx];
     // ... extract ConstantFilter, ConjunctionAndFilter, IsNull/IsNotNull
-    // ... encode constants, store in bind_data.filters
+    // ... encode constants, store in state->filters
 }
 
 // In TAEScanExecute():
@@ -873,14 +903,14 @@ optimal pipeline utilization.
 - ✅ CONSTANT vector support (single-value broadcast)
 - ✅ Projection pushdown (column pruning)
 - ✅ Parallel block scanning (atomic work dispatch, multi-threaded)
-- ✅ Planner statistics (cardinality + column min/max from zone maps)
+- ✅ Planner statistics (cardinality + column min/max from zone maps + null info from metadata)
 - ✅ Virtual columns (file_path, block_id)
 - ✅ Sampling pushdown (TABLESAMPLE SYSTEM via Bernoulli)
 - ✅ ORDER BY pushdown (set_scan_order: block reorder + limit pruning)
 - ✅ EXPLAIN integration (toString, dynamicToString)
 - ✅ Progress reporting
 - ✅ LZ4 decompression
-- ✅ 82 Catch2 tests, 444 assertions
+- ✅ 89 Catch2 tests, 472 assertions
 
 **Deliverables:**
 - `tae_scanner.so` DuckDB extension (~1,100 lines C++)

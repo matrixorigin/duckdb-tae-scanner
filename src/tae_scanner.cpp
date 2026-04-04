@@ -174,7 +174,7 @@ TAEScanBind(duckdb::ClientContext &context,
         return_types.push_back(bind_data->all_col_types[i]);
     }
 
-    return std::move(bind_data);
+    return bind_data;
 }
 
 // ===================================================================
@@ -186,44 +186,61 @@ TAEScanInit(duckdb::ClientContext &context,
     auto &bind = input.bind_data->Cast<TAEScanBindData>();
     auto state = duckdb::make_uniq<TAEScanState>();
 
-    // Build output_map: classify each requested column as TAE or virtual
-    // Also track projected TAE column indices for filter mapping
-    std::vector<duckdb::idx_t> projected_col_indices;
-    for (auto &col_id : input.column_ids) {
-        auto id = static_cast<duckdb::column_t>(col_id);
-        if (id == VCOL_FILENAME) {
-            state->output_map.push_back({OutputColumnInfo::VCOL_FILENAME, 0});
-        } else if (id == VCOL_BLOCK_ID) {
-            state->output_map.push_back({OutputColumnInfo::VCOL_BLOCK_ID, 0});
-        } else if (duckdb::IsVirtualColumn(id)) {
-            // Unknown virtual column — skip (shouldn't happen)
-            state->output_map.push_back({OutputColumnInfo::VCOL_FILENAME, 0});
-        } else {
-            auto tae_idx = static_cast<duckdb::idx_t>(id);
-            state->output_map.push_back({OutputColumnInfo::TAE_COLUMN, tae_idx});
-            state->read_seqnums.push_back(static_cast<uint16_t>(tae_idx));
-            projected_col_indices.push_back(tae_idx);
+    // Phase 1: Collect ALL TAE columns from column_ids into read_seqnums.
+    // Build a mapping: column_ids position → decoded_cols position.
+    // When filter_prune is active, column_ids includes filter-only columns
+    // that don't appear in the output DataChunk.
+    std::vector<duckdb::idx_t> col_ids_to_decoded(input.column_ids.size(), UINT64_MAX);
+    for (size_t ci = 0; ci < input.column_ids.size(); ci++) {
+        auto id = static_cast<duckdb::column_t>(input.column_ids[ci]);
+        if (!duckdb::IsVirtualColumn(id)) {
+            col_ids_to_decoded[ci] = state->read_seqnums.size();
+            state->read_seqnums.push_back(static_cast<uint16_t>(id));
         }
     }
 
-    // Extract pushed-down filters from DuckDB's TableFilterSet
+    // Phase 2: Build output_map from projection_ids (or column_ids if absent).
+    // projection_ids maps output DataChunk slots → positions in column_ids.
+    auto &proj_ids = input.projection_ids;
+    bool has_proj = !proj_ids.empty() && proj_ids.size() < input.column_ids.size();
+    auto n_out = has_proj ? proj_ids.size() : input.column_ids.size();
+    for (size_t oi = 0; oi < n_out; oi++) {
+        auto ci = has_proj ? proj_ids[oi] : oi;
+        auto id = static_cast<duckdb::column_t>(input.column_ids[ci]);
+        if (id == VCOL_FILENAME) {
+            state->output_map.push_back({OutputColumnInfo::VCOL_FILENAME, 0, 0});
+        } else if (id == VCOL_BLOCK_ID) {
+            state->output_map.push_back({OutputColumnInfo::VCOL_BLOCK_ID, 0, 0});
+        } else if (duckdb::IsVirtualColumn(id)) {
+            state->output_map.push_back({OutputColumnInfo::VCOL_FILENAME, 0, 0});
+        } else {
+            state->output_map.push_back({OutputColumnInfo::TAE_COLUMN,
+                                         static_cast<duckdb::idx_t>(id),
+                                         col_ids_to_decoded[ci]});
+        }
+    }
+
+    // Phase 3: Extract pushed-down filters.
+    // entry.GetIndex() is a position in column_ids; we map it to
+    // the decoded_cols position via col_ids_to_decoded.
     if (input.filters) {
         for (auto &entry : *input.filters) {
-            auto proj_idx = static_cast<duckdb::idx_t>(entry.GetIndex());
+            auto ci = static_cast<duckdb::idx_t>(entry.GetIndex());
             auto &filter = entry.Filter();
+            if (ci >= input.column_ids.size()) continue;
 
-            // Map projection index → table column index
-            if (proj_idx >= state->output_map.size()) continue;
-            auto &om = state->output_map[proj_idx];
-            if (om.kind != OutputColumnInfo::TAE_COLUMN) continue;
-            auto table_col = om.tae_col_idx;
+            auto id = static_cast<duckdb::column_t>(input.column_ids[ci]);
+            if (duckdb::IsVirtualColumn(id)) continue;
+            auto table_col = static_cast<duckdb::idx_t>(id);
             if (table_col >= bind.all_col_mo_oids.size()) continue;
+
+            auto decoded_pos = col_ids_to_decoded[ci];
+            if (decoded_pos == UINT64_MAX) continue;
 
             uint8_t mo_oid = bind.all_col_mo_oids[table_col];
             uint16_t seqnum = static_cast<uint16_t>(table_col);
-
             ExtractFilter(filter,
-                          static_cast<uint16_t>(proj_idx),
+                          static_cast<uint16_t>(decoded_pos),
                           seqnum, mo_oid,
                           state->filters);
         }
@@ -334,7 +351,7 @@ TAEScanInit(duckdb::ClientContext &context,
         }
     }
 
-    return std::move(state);
+    return state;
 }
 
 // ===================================================================
@@ -413,16 +430,14 @@ static void TAEScanExecute(duckdb::ClientContext &context,
         }
         output.SetCardinality(row_count);
 
-        // Fill output columns using output_map
-        duckdb::idx_t tae_col_pos = 0; // index into decoded_cols
+        // Fill output columns using output_map (decoded_pos indexes decoded_cols)
         for (duckdb::idx_t i = 0; i < gstate.output_map.size(); i++) {
             auto &om = gstate.output_map[i];
             switch (om.kind) {
             case OutputColumnInfo::TAE_COLUMN:
-                if (tae_col_pos < decoded_cols.size()) {
-                    FillColumn(output.data[i], decoded_cols[tae_col_pos], row_count);
+                if (om.decoded_pos < decoded_cols.size()) {
+                    FillColumn(output.data[i], decoded_cols[om.decoded_pos], row_count);
                 }
-                tae_col_pos++;
                 break;
             case OutputColumnInfo::VCOL_FILENAME: {
                 auto fname = bind.objects[wu.object_idx].file_path;
@@ -501,6 +516,7 @@ TAEScanStatistics(duckdb::ClientContext &context,
         try {
             auto &fs = duckdb::FileSystem::GetFileSystem(context);
             TAEObjectReader reader(fs, full_path);
+            reader.ReadMeta();
 
             for (uint32_t blk = 0; blk < reader.BlockCount(); blk++) {
                 const uint8_t *zm = reader.GetZoneMap(blk, seqnum);
@@ -511,34 +527,36 @@ TAEScanStatistics(duckdb::ClientContext &context,
                 const uint8_t *zm_max = zm + ZM_MAX_OFF;
 
                 if (IsStringType(oid)) {
-                    auto min_str = ZoneMapBytesToString(zm_min);
-                    auto max_str = ZoneMapBytesToString(zm_max);
-                    auto min_val = duckdb::Value(min_str);
-                    auto max_val = duckdb::Value(max_str);
+                    auto min_val = duckdb::Value(ZoneMapBytesToString(zm_min));
+                    auto max_val = duckdb::Value(ZoneMapBytesToString(zm_max));
                     if (!has_stats) {
-                        global_min = min_val;
-                        global_max = max_val;
+                        global_min = std::move(min_val);
+                        global_max = std::move(max_val);
                         has_stats = true;
                     } else {
-                        if (min_val < global_min) global_min = min_val;
-                        if (max_val > global_max) global_max = max_val;
+                        if (min_val < global_min) global_min = std::move(min_val);
+                        if (max_val > global_max) global_max = std::move(max_val);
                     }
                 } else {
                     auto min_val = ZoneMapBytesToValue(zm_min, oid, col_type);
                     auto max_val = ZoneMapBytesToValue(zm_max, oid, col_type);
                     if (min_val.IsNull() || max_val.IsNull()) continue;
                     if (!has_stats) {
-                        global_min = min_val;
-                        global_max = max_val;
+                        global_min = std::move(min_val);
+                        global_max = std::move(max_val);
                         has_stats = true;
                     } else {
-                        if (min_val < global_min) global_min = min_val;
-                        if (max_val > global_max) global_max = max_val;
+                        if (min_val < global_min) global_min = std::move(min_val);
+                        if (max_val > global_max) global_max = std::move(max_val);
                     }
                 }
 
-                // Check null flag
-                if (zm[64] != 0) has_nulls = true;
+                // Check null count from column metadata
+                auto &blk_info = reader.Meta().blocks[blk];
+                if (seqnum < blk_info.columns.size() &&
+                    blk_info.columns[seqnum].null_cnt > 0) {
+                    has_nulls = true;
+                }
             }
         } catch (...) {
             return nullptr; // can't read → no stats
