@@ -71,9 +71,16 @@ MO_T_INT64      = 23
 MO_T_FLOAT64    = 31
 MO_T_DECIMAL64  = 32
 MO_T_DECIMAL128 = 33
+MO_T_DATE       = 50
+MO_T_DATETIME   = 52
+MO_T_TIMESTAMP  = 53
 MO_T_VARCHAR    = 61
 MO_T_UUID       = 63
 MO_T_BLOB       = 70
+
+# MO epoch offsets (counting from year 1 AD)
+MO_UNIX_EPOCH_DAYS = 719162          # DateFromCalendar(1970,1,1)
+MO_UNIX_EPOCH_USEC = 62135596800000000  # DatetimeFromClock(1970,1,1,0,0,0,0)
 
 # Varlena
 VARLENA_SIZE       = 24
@@ -255,7 +262,11 @@ def build_vector(mo_type_oid, elem_size, values, nulls=None, is_varchar=False,
             data_bytes = bytes(1 if v else 0 for v in values)
         elif mo_type_oid == MO_T_INT32:
             data_bytes = b''.join(struct.pack('<i', v if v is not None else 0) for v in values)
+        elif mo_type_oid == MO_T_DATE:
+            data_bytes = b''.join(struct.pack('<i', v if v is not None else 0) for v in values)
         elif mo_type_oid == MO_T_INT64:
+            data_bytes = b''.join(struct.pack('<q', v if v is not None else 0) for v in values)
+        elif mo_type_oid in (MO_T_DATETIME, MO_T_TIMESTAMP):
             data_bytes = b''.join(struct.pack('<q', v if v is not None else 0) for v in values)
         elif mo_type_oid == MO_T_FLOAT64:
             data_bytes = b''.join(struct.pack('<d', v if v is not None else 0.0) for v in values)
@@ -832,6 +843,73 @@ def gen_with_types(outdir):
     return path, dec64_vals, dec128_vals, uuid_strs, blob_vals, int_vals
 
 
+def gen_with_datetime(outdir):
+    """1 block, 3 columns: date(int32), timestamp(int64), int32 (reference).
+    6 rows with known date/timestamp values spanning pre/post Unix epoch.
+    Values are stored in MO epoch (days/usec since year 1 AD).
+    """
+    from datetime import date, datetime
+
+    # Known dates covering various ranges
+    test_dates = [
+        date(2024, 1, 15),   # recent
+        date(2000, 1, 1),    # Y2K
+        date(1970, 1, 1),    # Unix epoch boundary
+        date(1969, 12, 31),  # pre-Unix epoch
+        date(2024, 12, 31),  # end of year
+        date(1999, 6, 15),   # mid-year
+    ]
+    # Convert to MO epoch (days since year 1 AD)
+    date_mo_vals = [(d - date(1, 1, 1)).days for d in test_dates]
+
+    # Known timestamps
+    test_timestamps = [
+        datetime(2024, 1, 15, 12, 30, 45),
+        datetime(2000, 1, 1, 0, 0, 0),
+        datetime(1970, 1, 1, 0, 0, 0),
+        datetime(2024, 6, 15, 23, 59, 59, 999000),
+        datetime(1999, 12, 31, 23, 59, 59),
+        datetime(2020, 2, 29, 0, 0, 0),       # leap day
+    ]
+    # Convert to MO epoch (microseconds since year 1 AD)
+    ts_mo_vals = [
+        int((ts - datetime(1, 1, 1)).total_seconds() * 1_000_000)
+        for ts in test_timestamps
+    ]
+
+    int_vals = [1, 2, 3, 4, 5, 6]
+
+    builder = TAEFileBuilder()
+    builder.add_block({
+        'rows': 6,
+        'columns': [
+            {
+                'mo_type': MO_T_DATE,
+                'vector_bytes': build_vector(MO_T_DATE, 4, date_mo_vals),
+                'zone_map': build_zone_map_numeric(MO_T_DATE, min(date_mo_vals), max(date_mo_vals), 4),
+                'ndv': 6,
+            },
+            {
+                'mo_type': MO_T_TIMESTAMP,
+                'vector_bytes': build_vector(MO_T_TIMESTAMP, 8, ts_mo_vals),
+                'zone_map': build_zone_map_numeric(MO_T_TIMESTAMP, min(ts_mo_vals), max(ts_mo_vals), 8),
+                'ndv': 6,
+            },
+            {
+                'mo_type': MO_T_INT32,
+                'vector_bytes': build_vector(MO_T_INT32, 4, int_vals),
+                'zone_map': build_zone_map_numeric(MO_T_INT32, 1, 6, 4),
+                'ndv': 6,
+            },
+        ],
+    })
+
+    path = os.path.join(outdir, 'with_datetime.tae')
+    with open(path, 'wb') as f:
+        f.write(builder.build())
+    return path, test_dates, test_timestamps, int_vals
+
+
 def gen_lz4_compressed(outdir):
     """1 block, 3 columns (int32, varchar, float64), 8 rows, LZ4-compressed.
 
@@ -909,6 +987,7 @@ def main():
     part2_path = gen_basic_3col_part2(outdir)
     const_path = gen_with_constants(outdir)
     types_path, _, _, _, _, _ = gen_with_types(outdir)
+    datetime_path, _, _, _ = gen_with_datetime(outdir)
     lz4_path, _, _, _ = gen_lz4_compressed(outdir)
 
     gen_manifest(outdir, [basic_path])
@@ -1009,6 +1088,28 @@ def main():
     with open(lz4_mf_path, 'w') as f:
         json.dump(lz4_manifest, f, indent=2)
 
+    # Date/timestamp manifest
+    datetime_manifest = {
+        'database': 'test_db',
+        'table': 'test_datetime',
+        'columns': [
+            {'name': 'col_date', 'oid': MO_T_DATE},
+            {'name': 'col_ts', 'oid': MO_T_TIMESTAMP},
+            {'name': 'col_ref', 'oid': MO_T_INT32},
+        ],
+        'objects': [
+            {
+                'path': os.path.basename(datetime_path),
+                'rows': 6,
+                'blocks': 1,
+                'size': os.path.getsize(datetime_path),
+            },
+        ],
+    }
+    datetime_mf_path = os.path.join(outdir, 'manifest_datetime.json')
+    with open(datetime_mf_path, 'w') as f:
+        json.dump(datetime_manifest, f, indent=2)
+
     # Sorted manifest: multi_block.tae with sort_column for ORDER BY pushdown
     sorted_manifest = {
         'database': 'test_db',
@@ -1038,11 +1139,13 @@ def main():
     print(f'  {os.path.basename(nulls_path)}  ({os.path.getsize(nulls_path)} bytes)')
     print(f'  {os.path.basename(const_path)}  ({os.path.getsize(const_path)} bytes)')
     print(f'  {os.path.basename(types_path)}  ({os.path.getsize(types_path)} bytes)')
+    print(f'  {os.path.basename(datetime_path)}  ({os.path.getsize(datetime_path)} bytes)')
     print(f'  {os.path.basename(lz4_path)}  ({os.path.getsize(lz4_path)} bytes, LZ4)')
     print(f'  manifest.json')
     print(f'  manifest_multifile.json')
     print(f'  manifest_constants.json')
     print(f'  manifest_types.json')
+    print(f'  manifest_datetime.json')
     print(f'  manifest_lz4.json')
     print(f'  manifest_sorted.json')
 

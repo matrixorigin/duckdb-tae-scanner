@@ -649,6 +649,84 @@ TEST_CASE("Scan: project subset of extended types", "[types]") {
 }
 
 // ===================================================================
+// Date / Timestamp types
+// ===================================================================
+
+TEST_CASE("Scan: date column returns correct calendar dates", "[types][datetime]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT col_date, col_ref FROM tae_scan('" +
+                              ManifestPath("manifest_datetime.json") +
+                              "') ORDER BY col_ref");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 6);
+    // Dates: 2024-01-15, 2000-01-01, 1970-01-01, 1969-12-31, 2024-12-31, 1999-06-15
+    CHECK(result->GetValue(0, 0).ToString() == "2024-01-15");
+    CHECK(result->GetValue(0, 1).ToString() == "2000-01-01");
+    CHECK(result->GetValue(0, 2).ToString() == "1970-01-01");
+    CHECK(result->GetValue(0, 3).ToString() == "1969-12-31");
+    CHECK(result->GetValue(0, 4).ToString() == "2024-12-31");
+    CHECK(result->GetValue(0, 5).ToString() == "1999-06-15");
+}
+
+TEST_CASE("Scan: timestamp column returns correct values", "[types][datetime]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT col_ts, col_ref FROM tae_scan('" +
+                              ManifestPath("manifest_datetime.json") +
+                              "') ORDER BY col_ref");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 6);
+    // Timestamps: 2024-01-15 12:30:45, 2000-01-01 00:00:00, 1970-01-01 00:00:00,
+    //             2024-06-15 23:59:59.999, 1999-12-31 23:59:59, 2020-02-29 00:00:00
+    CHECK(result->GetValue(0, 0).ToString() == "2024-01-15 12:30:45");
+    CHECK(result->GetValue(0, 1).ToString() == "2000-01-01 00:00:00");
+    CHECK(result->GetValue(0, 2).ToString() == "1970-01-01 00:00:00");
+    CHECK(result->GetValue(0, 3).ToString() == "2024-06-15 23:59:59.999");
+    CHECK(result->GetValue(0, 4).ToString() == "1999-12-31 23:59:59");
+    CHECK(result->GetValue(0, 5).ToString() == "2020-02-29 00:00:00");
+}
+
+TEST_CASE("Scan: date filter pushdown works", "[types][datetime]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT col_date FROM tae_scan('" +
+                              ManifestPath("manifest_datetime.json") +
+                              "') WHERE col_date >= DATE '2024-01-01' ORDER BY col_date");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 2);
+    CHECK(result->GetValue(0, 0).ToString() == "2024-01-15");
+    CHECK(result->GetValue(0, 1).ToString() == "2024-12-31");
+}
+
+TEST_CASE("Scan: timestamp filter pushdown works", "[types][datetime]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT col_ts FROM tae_scan('" +
+                              ManifestPath("manifest_datetime.json") +
+                              "') WHERE col_ts < TIMESTAMP '2000-01-01 00:00:01' ORDER BY col_ts");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 3);
+    CHECK(result->GetValue(0, 0).ToString() == "1970-01-01 00:00:00");
+    CHECK(result->GetValue(0, 1).ToString() == "1999-12-31 23:59:59");
+    CHECK(result->GetValue(0, 2).ToString() == "2000-01-01 00:00:00");
+}
+
+TEST_CASE("Stats: date MIN/MAX aggregates", "[stats][datetime]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT MIN(col_date), MAX(col_date) FROM tae_scan('" +
+                              ManifestPath("manifest_datetime.json") + "')");
+    REQUIRE_FALSE(result->HasError());
+    CHECK(result->GetValue(0, 0).ToString() == "1969-12-31");
+    CHECK(result->GetValue(1, 0).ToString() == "2024-12-31");
+}
+
+TEST_CASE("Stats: timestamp MIN/MAX aggregates", "[stats][datetime]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT MIN(col_ts), MAX(col_ts) FROM tae_scan('" +
+                              ManifestPath("manifest_datetime.json") + "')");
+    REQUIRE_FALSE(result->HasError());
+    CHECK(result->GetValue(0, 0).ToString() == "1970-01-01 00:00:00");
+    CHECK(result->GetValue(1, 0).ToString() == "2024-06-15 23:59:59.999");
+}
+
+// ===================================================================
 // LZ4-compressed data
 // ===================================================================
 
