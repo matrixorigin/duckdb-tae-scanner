@@ -559,7 +559,7 @@ duckdb_tae_scanner/
 │   └── tae_scanner_extension.cpp     Extension entry point
 └── test/
     ├── gen_test_data.py              Python TAE binary writer (test fixtures)
-    ├── test_scan.cpp                 Catch2 end-to-end tests (70 tests)
+    ├── test_scan.cpp                 Catch2 end-to-end tests (95 tests)
     └── data/                         Generated .tae files + manifest JSONs
 ```
 
@@ -820,7 +820,7 @@ Tombstone objects use the same TAE binary format. The "data" columns are:
 
 ## 11. Consistency Model
 
-### 12.1 Snapshot Isolation
+### 11.1 Snapshot Isolation
 
 The scanner reads a **point-in-time snapshot** of committed, flushed data. This means:
 
@@ -828,7 +828,7 @@ The scanner reads a **point-in-time snapshot** of committed, flushed data. This 
 - Rows still in the TN's in-memory buffer (not yet flushed) are **not** visible
 - Concurrent modifications during the scan do not affect results (immutable files)
 
-### 12.2 Ensuring All Data Is Flushed
+### 11.2 Ensuring All Data Is Flushed
 
 For TPC-H benchmarking, after `LOAD DATA`:
 
@@ -843,7 +843,7 @@ MO's `commitWorkspaceThreshold = 1MB`. Since TPC-H tables are much larger, data 
 written directly to disk during `LOAD DATA`. An explicit flush is only needed for
 small tables or recent small inserts.
 
-### 12.3 Future: MVCC Integration
+### 11.3 Future: MVCC Integration
 
 For live HTAP workloads, the scanner would need to:
 1. Acquire a snapshot timestamp from MO
@@ -985,7 +985,7 @@ make -j$(nproc) tae_tests
 cd duckdb_tae_scanner
 python3 test/gen_test_data.py
 
-# Run all 70 tests
+# Run all 95 tests
 cd build && ./test/tae_tests
 
 # Run specific test tags
