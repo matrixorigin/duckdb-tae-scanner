@@ -449,6 +449,17 @@ static void TAEScanExecute(duckdb::ClientContext &context,
 
         // Read the block (only TAE columns, not virtual)
         gstate.blocks_scanned.fetch_add(1, std::memory_order_relaxed);
+
+        // Look-ahead prefetch: hint the OS to start reading the next block
+        // while we process this one. This overlaps I/O with CPU decoding.
+        auto peek_idx = gstate.next_work_unit.load(std::memory_order_relaxed);
+        if (peek_idx < gstate.work_units.size()) {
+            auto &next_wu = gstate.work_units[peek_idx];
+            if (next_wu.object_idx == wu.object_idx) {
+                reader->PrefetchBlock(next_wu.block_idx, gstate.read_seqnums);
+            }
+        }
+
         auto decoded_cols = reader->ReadBlock(wu.block_idx, gstate.read_seqnums);
         if (decoded_cols.empty() && !gstate.read_seqnums.empty()) continue;
 

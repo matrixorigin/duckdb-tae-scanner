@@ -18,6 +18,10 @@
 #include <string>
 #include <vector>
 
+#ifdef __linux__
+#include <fcntl.h>
+#endif
+
 #include "duckdb/common/file_system.hpp"
 
 namespace tae {
@@ -206,6 +210,14 @@ public:
     void SetPrefetchThreshold(uint64_t bytes) { prefetch_threshold_ = bytes; }
     uint64_t GetPrefetchThreshold() const { return prefetch_threshold_; }
 
+    // Advisory prefetch: hint the OS to read a byte range into page cache.
+    // Returns immediately (non-blocking). Effective on local Linux filesystems.
+    void PrefetchRange(uint64_t offset, uint64_t length);
+
+    // Prefetch all column extents for a specific block.
+    // Useful for look-ahead: call on block N+1 while processing block N.
+    void PrefetchBlock(uint32_t block_idx, const std::vector<uint16_t> &seqnums);
+
 private:
     std::vector<uint8_t> ReadBytes(uint64_t offset, uint64_t length);
     static std::vector<uint8_t> DecompressLZ4(const uint8_t *src, uint32_t src_len,
@@ -228,6 +240,8 @@ private:
     uint64_t                                prefetch_threshold_ = 4 * 1024 * 1024;
     bool                                    prefetch_attempted_ = false;
     std::vector<uint8_t>                    prefetch_buf_;
+    // Advisory fd for posix_fadvise (Linux only, -1 if unavailable)
+    int                                     advise_fd_ = -1;
 };
 
 } // namespace tae

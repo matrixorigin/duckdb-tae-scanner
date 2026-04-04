@@ -10,6 +10,10 @@
 #include <cstring>
 #include <stdexcept>
 
+#ifdef __linux__
+#include <unistd.h>
+#endif
+
 // LZ4 decompression
 #include <lz4.h>
 
@@ -23,10 +27,24 @@ TAEObjectReader::TAEObjectReader(duckdb::FileSystem &fs, const std::string &file
     : fs_(fs), file_path_(file_path), file_size_(0), meta_{} {
     file_handle_ = fs_.OpenFile(file_path, duckdb::FileOpenFlags::FILE_FLAGS_READ);
     file_size_ = fs_.GetFileSize(*file_handle_);
+#ifdef __linux__
+    // Open a separate advisory fd for posix_fadvise hints.
+    // This avoids depending on DuckDB's internal FileHandle layout.
+    advise_fd_ = open(file_path.c_str(), O_RDONLY);
+    if (advise_fd_ >= 0) {
+        // SEQUENTIAL hint doubles kernel readahead window
+        posix_fadvise(advise_fd_, 0, 0, POSIX_FADV_SEQUENTIAL);
+    }
+#endif
 }
 
 TAEObjectReader::~TAEObjectReader() {
-    // FileHandle closes automatically via destructor
+#ifdef __linux__
+    if (advise_fd_ >= 0) {
+        close(advise_fd_);
+        advise_fd_ = -1;
+    }
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -61,6 +79,40 @@ std::vector<uint8_t> TAEObjectReader::ReadBytes(uint64_t offset, uint64_t length
     std::vector<uint8_t> buf(length);
     fs_.Read(*file_handle_, buf.data(), static_cast<int64_t>(length), offset);
     return buf;
+}
+
+// ---------------------------------------------------------------------------
+// PrefetchRange — advisory hint for kernel page cache
+// ---------------------------------------------------------------------------
+
+void TAEObjectReader::PrefetchRange(uint64_t offset, uint64_t length) {
+    // Skip if entire file is already cached in memory
+    if (!prefetch_buf_.empty()) return;
+#ifdef __linux__
+    if (advise_fd_ >= 0 && length > 0) {
+        posix_fadvise(advise_fd_, static_cast<off_t>(offset),
+                      static_cast<off_t>(length), POSIX_FADV_WILLNEED);
+    }
+#else
+    (void)offset;
+    (void)length;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// PrefetchBlock — prefetch all column extents for a block
+// ---------------------------------------------------------------------------
+
+void TAEObjectReader::PrefetchBlock(uint32_t block_idx,
+                                     const std::vector<uint16_t> &seqnums) {
+    if (block_idx >= meta_.blocks.size()) return;
+    auto &blk = meta_.blocks[block_idx];
+    for (auto seq : seqnums) {
+        if (seq < blk.columns.size()) {
+            auto &ext = blk.columns[seq].location;
+            PrefetchRange(ext.offset, ext.length);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
