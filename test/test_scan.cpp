@@ -712,3 +712,73 @@ TEST_CASE("Scan: LZ4-compressed EXPLAIN works", "[lz4]") {
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->RowCount() > 0);
 }
+
+// ===================================================================
+// ORDER BY pushdown (set_scan_order)
+// ===================================================================
+
+TEST_CASE("Scan: ORDER BY ASC LIMIT returns correct values", "[orderby]") {
+    auto db = MakeDB();
+    // multi_block.tae: block 0 = [1,2,3,4], block 1 = [100,200,300,400]
+    // ORDER BY col_int ASC LIMIT 3 should return [1, 2, 3]
+    auto result = Query(*db, "SELECT col_int FROM tae_scan('" +
+                              ManifestPath("manifest_sorted.json") +
+                              "') ORDER BY col_int ASC LIMIT 3");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 3);
+    CHECK(result->GetValue(0, 0) == Value::INTEGER(1));
+    CHECK(result->GetValue(0, 1) == Value::INTEGER(2));
+    CHECK(result->GetValue(0, 2) == Value::INTEGER(3));
+}
+
+TEST_CASE("Scan: ORDER BY DESC LIMIT returns correct values", "[orderby]") {
+    auto db = MakeDB();
+    // ORDER BY col_int DESC LIMIT 3 should return [400, 300, 200]
+    auto result = Query(*db, "SELECT col_int FROM tae_scan('" +
+                              ManifestPath("manifest_sorted.json") +
+                              "') ORDER BY col_int DESC LIMIT 3");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 3);
+    CHECK(result->GetValue(0, 0) == Value::INTEGER(400));
+    CHECK(result->GetValue(0, 1) == Value::INTEGER(300));
+    CHECK(result->GetValue(0, 2) == Value::INTEGER(200));
+}
+
+TEST_CASE("Scan: ORDER BY LIMIT larger than one block", "[orderby]") {
+    auto db = MakeDB();
+    // LIMIT 6 needs both blocks (4 + 4 rows)
+    auto result = Query(*db, "SELECT col_int FROM tae_scan('" +
+                              ManifestPath("manifest_sorted.json") +
+                              "') ORDER BY col_int ASC LIMIT 6");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 6);
+    CHECK(result->GetValue(0, 0) == Value::INTEGER(1));
+    CHECK(result->GetValue(0, 5) == Value::INTEGER(200));
+}
+
+TEST_CASE("Scan: ORDER BY without LIMIT still works", "[orderby]") {
+    auto db = MakeDB();
+    // Without LIMIT, set_scan_order won't fire but query should still work
+    auto result = Query(*db, "SELECT col_int FROM tae_scan('" +
+                              ManifestPath("manifest_sorted.json") +
+                              "') ORDER BY col_int ASC");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 8);
+    CHECK(result->GetValue(0, 0) == Value::INTEGER(1));
+    CHECK(result->GetValue(0, 7) == Value::INTEGER(400));
+}
+
+TEST_CASE("Scan: sort_column parsed from manifest", "[orderby]") {
+    auto db = MakeDB();
+    // Verify manifest with sort_column works for basic queries too
+    auto result = Query(*db, "SELECT col_int, col_bool FROM tae_scan('" +
+                              ManifestPath("manifest_sorted.json") +
+                              "') ORDER BY col_int ASC");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 8);
+    // First 4 rows from block 0: [1,2,3,4] with bools [T,F,T,F]
+    CHECK(result->GetValue(0, 0) == Value::INTEGER(1));
+    CHECK(result->GetValue(1, 0) == Value::BOOLEAN(true));
+    CHECK(result->GetValue(0, 1) == Value::INTEGER(2));
+    CHECK(result->GetValue(1, 1) == Value::BOOLEAN(false));
+}

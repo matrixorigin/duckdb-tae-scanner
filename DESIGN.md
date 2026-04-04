@@ -717,18 +717,66 @@ diagnostic logging. A high skip ratio indicates effective pushdown.
 
 ---
 
-## 9. Tombstone Handling (Deleted Rows)
+## 9. ORDER BY Pushdown (Scan Order Optimization)
+
+MO objects are sorted by primary key. When DuckDB detects `ORDER BY col LIMIT N`,
+its RowGroupPruner optimizer calls our `set_scan_order` callback, enabling two
+optimizations:
+
+### 9.1 Block Reordering
+
+Work units are sorted by zone map statistics of the ORDER BY column:
+- **ASC**: sort by zone map **min** value (smallest-first)
+- **DESC**: sort by zone map **max** value (largest-first)
+
+This ensures blocks most likely to satisfy the query are scanned first.
+
+### 9.2 Early Termination (Row Limit Pruning)
+
+When `row_limit` is provided, we truncate the work queue once enough rows are
+available. For example, `LIMIT 3` on blocks of 4 rows each → only 1 block scanned.
+
+### 9.3 Manifest Sort Column
+
+The manifest JSON supports an optional `"sort_column"` field declaring which column
+the data is sorted by. This metadata enables the optimizer to push down ORDER BY:
+
+```json
+{
+  "sort_column": "pk_column",
+  "columns": [...],
+  "objects": [...]
+}
+```
+
+### 9.4 Callback Flow
+
+```
+  RowGroupPruner optimizer
+       │
+       ▼
+  TAESetScanOrder(options, bind_data)
+       │  extract: column_idx, ASC/DESC, MIN/MAX stat, row_limit
+       ▼
+  TAEScanInit
+       │  sort work_units by zone map of order column
+       │  truncate work queue if row_limit allows
+       ▼
+  TAEScanExecute → scans blocks in optimal order
+```
+
+## 10. Tombstone Handling (Deleted Rows)
 
 MO uses **row-level tombstones** to mark deleted rows. A separate tombstone object
 contains `(Rowid, CommitTS)` pairs indicating which rows in which blocks have been
 deleted.
 
-### 9.1 Phase 1: Ignore Tombstones
+### 10.1 Phase 1: Ignore Tombstones
 
 For initial TPC-H benchmarking (read-only workload after bulk load), there are no
 deletes. We can safely skip tombstone handling.
 
-### 9.2 Phase 2: Apply Tombstones
+### 10.2 Phase 2: Apply Tombstones
 
 1. During bind, also enumerate tombstone objects for the table
 2. For each data block, check if any tombstone entries reference rows in that block
@@ -740,9 +788,9 @@ Tombstone objects use the same TAE binary format. The "data" columns are:
 
 ---
 
-## 10. Consistency Model
+## 11. Consistency Model
 
-### 10.1 Snapshot Isolation
+### 12.1 Snapshot Isolation
 
 The scanner reads a **point-in-time snapshot** of committed, flushed data. This means:
 
@@ -750,7 +798,7 @@ The scanner reads a **point-in-time snapshot** of committed, flushed data. This 
 - Rows still in the TN's in-memory buffer (not yet flushed) are **not** visible
 - Concurrent modifications during the scan do not affect results (immutable files)
 
-### 10.2 Ensuring All Data Is Flushed
+### 12.2 Ensuring All Data Is Flushed
 
 For TPC-H benchmarking, after `LOAD DATA`:
 
@@ -765,7 +813,7 @@ MO's `commitWorkspaceThreshold = 1MB`. Since TPC-H tables are much larger, data 
 written directly to disk during `LOAD DATA`. An explicit flush is only needed for
 small tables or recent small inserts.
 
-### 10.3 Future: MVCC Integration
+### 12.3 Future: MVCC Integration
 
 For live HTAP workloads, the scanner would need to:
 1. Acquire a snapshot timestamp from MO
@@ -776,32 +824,32 @@ This requires a connection to MO's catalog service, which is Phase 3 scope.
 
 ---
 
-## 11. Performance Considerations
+## 12. Performance Considerations
 
-### 11.1 I/O Pattern
+### 12.1 I/O Pattern
 
 - **Sequential within object**: metadata → column data blocks (increasing offsets)
 - **Random across objects**: different files, but each file read sequentially
 - **Read coalescing**: batch multiple column reads into a single `pread()` covering
   the bounding range, then slice per column (reduces syscall overhead)
 
-### 11.2 Compression
+### 12.2 Compression
 
 LZ4 decompression throughput: ~3-4 GB/s per core. For TPC-H SF10 lineitem (~7 GB raw),
 decompression takes ~2 seconds on a single core. This is negligible compared to GPU
 execution time.
 
-### 11.3 PCIe Bandwidth
+### 12.3 PCIe Bandwidth
 
 PCIe 4.0 x16: ~25 GB/s Host-to-Device. TPC-H SF10 lineitem after column projection
 (typically 3-5 columns) is ~1-2 GB. Transfer time: ~80ms. Not a bottleneck.
 
-### 11.4 Memory Layout
+### 12.4 Memory Layout
 
 DuckDB DataChunk uses flat columnar layout — same as GPU `cudf::column`. After the
 scanner fills a DataChunk, Sirius can `cudaMemcpyAsync` directly without reshuffling.
 
-### 11.5 Block Size
+### 12.5 Block Size
 
 MO blocks contain up to 8,192 rows. DuckDB's standard vector size is 2,048. The
 scanner should split MO blocks into DuckDB-sized chunks (4 chunks per block) for
@@ -809,7 +857,7 @@ optimal pipeline utilization.
 
 ---
 
-## 12. Phased Implementation Plan
+## 13. Phased Implementation Plan
 
 ### Phase 1: Local Filesystem + Static Schema ✅ Complete
 
@@ -828,10 +876,11 @@ optimal pipeline utilization.
 - ✅ Planner statistics (cardinality + column min/max from zone maps)
 - ✅ Virtual columns (file_path, block_id)
 - ✅ Sampling pushdown (TABLESAMPLE SYSTEM via Bernoulli)
+- ✅ ORDER BY pushdown (set_scan_order: block reorder + limit pruning)
 - ✅ EXPLAIN integration (toString, dynamicToString)
 - ✅ Progress reporting
 - ✅ LZ4 decompression
-- ✅ 70 Catch2 tests, 380 assertions
+- ✅ 82 Catch2 tests, 444 assertions
 
 **Deliverables:**
 - `tae_scanner.so` DuckDB extension (~1,100 lines C++)
@@ -873,9 +922,9 @@ transparently — any `s3://` path in the manifest works out of the box.
 
 ---
 
-## 13. Build and Test
+## 14. Build and Test
 
-### 13.1 Prerequisites
+### 14.1 Prerequisites
 
 ```bash
 # DuckDB (source tree required for headers)
@@ -888,7 +937,7 @@ pacman -S lz4                 # Arch/Manjaro
 brew install lz4              # macOS
 ```
 
-### 13.2 Build
+### 14.2 Build
 
 ```bash
 cd duckdb_tae_scanner
@@ -899,7 +948,7 @@ cmake .. -DDUCKDB_DIR=/path/to/duckdb \
 make -j$(nproc) tae_tests
 ```
 
-### 13.3 Unit Tests (Catch2)
+### 14.3 Unit Tests (Catch2)
 
 ```bash
 # Generate test data (run from project root, not test/)
@@ -918,7 +967,7 @@ cd build && ./test/tae_tests
 ./test/tae_tests "[constant]"     # CONSTANT vector tests
 ```
 
-### 13.4 Test with TPC-H
+### 14.4 Test with TPC-H
 
 ```bash
 # 1. Start MO with local filesystem
@@ -949,7 +998,7 @@ D> CALL gpu_execution('
 
 ---
 
-## 14. Risk Assessment
+## 15. Risk Assessment
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
@@ -962,7 +1011,7 @@ D> CALL gpu_execution('
 
 ---
 
-## 15. References
+## 16. References
 
 - MatrixOne source: `pkg/objectio/` — TAE object I/O layer
 - MatrixOne source: `pkg/container/vector/` — vector serialization
@@ -979,7 +1028,7 @@ D> CALL gpu_execution('
 
 ---
 
-## 16. MO → Sirius Integration Architecture
+## 17. MO → Sirius Integration Architecture
 
 This section describes how MatrixOne routes analytical queries to Sirius for
 GPU-accelerated execution. Three integration paths are presented, from simplest
@@ -987,7 +1036,7 @@ to most sophisticated. All paths use `tae_scan()` as the data access layer and
 a **Sirius sidecar process** (DuckDB + Sirius extension + tae_scanner extension)
 running alongside MO.
 
-### 16.1 Three Integration Paths
+### 17.1 Three Integration Paths
 
 | | Path 1: Manual CLI | Path 2: SQL Forwarding | Path 3: Substrait Plan |
 |---|---|---|---|
@@ -1022,7 +1071,7 @@ User → MO → builds optimized plan → converts to Substrait bytes
          → sends protobuf via gRPC → Sirius from_substrait() → GPU → results → MO → client
 ```
 
-### 16.2 Sirius Sidecar Process
+### 17.2 Sirius Sidecar Process
 
 All integration paths (except Path 1) require a **sidecar process** — a separate
 DuckDB instance running Sirius and tae_scanner extensions on a GPU-equipped machine.
@@ -1066,7 +1115,7 @@ sirius-sidecar --port 50051 \
     --data-dir /mo-data/shared/
 ```
 
-### 16.3 How Sirius Works Today
+### 17.3 How Sirius Works Today
 
 Sirius is a DuckDB extension that intercepts physical plans and routes operators to GPU.
 The current entry point is:
@@ -1095,7 +1144,7 @@ if (scan_op.function.name == "tae_scan")      → sirius_physical_duckdb_scan  /
 Our `tae_scan()` function produces standard DuckDB DataChunks, so it works via
 `sirius_physical_duckdb_scan` without Sirius modifications.
 
-### 16.4 Substrait as the Plan Exchange Format
+### 17.4 Substrait as the Plan Exchange Format
 
 Substrait is a cross-database query plan format supported by DuckDB (via extension),
 Apache Arrow, Velox, and others. Sirius already bundles the DuckDB Substrait extension.
@@ -1115,7 +1164,7 @@ CALL from_substrait(x'12090a...');                                     → resul
 CALL from_substrait_json('{"relations":[...]}');                       → results
 ```
 
-### 16.5 Path 2 Detail: SQL String Forwarding
+### 17.5 Path 2 Detail: SQL String Forwarding
 
 MO rewrites SQL, replacing table names with `tae_scan()` calls, and forwards the
 SQL string to the sidecar. The sidecar calls `gpu_execution()` internally.
@@ -1134,7 +1183,7 @@ SQL string to the sidecar. The sidecar calls `gpu_execution()` internally.
 **Pros:** No Sirius code changes. Simple deployment. MO changes are minimal.
 **Cons:** Extra process to manage. SQL-string interface loses type safety.
 
-### 16.6 Path 3 Detail: Substrait Plan Exchange
+### 17.6 Path 3 Detail: Substrait Plan Exchange
 
 The production target. MO compiles its plan, serializes to Substrait protobuf,
 and the sidecar deserializes and executes. This preserves MO's query optimization.
@@ -1250,7 +1299,7 @@ MO Frontend → MySQL Protocol → Client
 **Pros:** Full plan optimization on both sides. Type-safe. Extensible.
 **Cons:** Significant work on MO→Substrait converter. Custom ExtensionTable handler in Sirius.
 
-### 16.7 Unified Query Router
+### 17.7 Unified Query Router
 
 All three paths coexist in a single deployment. The MO router selects the best
 execution path for each query:
@@ -1351,7 +1400,7 @@ This layered approach means:
 - **Eventually:** Most queries go through Path 3; Path 2 handles edge cases
 - **Always:** Path 1 available for manual/debug use
 
-### 16.8 MO Interception Points
+### 17.8 MO Interception Points
 
 Based on MO's query execution flow:
 
@@ -1372,12 +1421,12 @@ MO already has a pattern for remote execution: `RemoteRun()` in
 CN nodes via RPC. The Sirius routing follows the same pattern, but sends to a
 GPU sidecar instead of another CN.
 
-### 16.9 Integration Rollout (Complements §12 Extension Phases)
+### 17.9 Integration Rollout (Complements §13 Extension Phases)
 
-§12 phases the *scanner extension* (local→S3→catalog→Substrait). This section
+§13 phases the *scanner extension* (local→S3→catalog→Substrait). This section
 phases the *MO↔Sirius integration* — they run in parallel:
 
-| §12 Extension Phase | §16 Integration Step | Combined Effect |
+| §13 Extension Phase | §17 Integration Step | Combined Effect |
 |---------------------|---------------------|-----------------|
 | Phase 1: Local scan | Step 1: Path 1 (CLI) | Manual DuckDB queries on local TAE files |
 | Phase 2: S3 support | Step 2: Path 2 (SQL) | MO auto-routes queries, sidecar reads S3 |
@@ -1395,7 +1444,7 @@ MO routes analytical queries automatically. ~500 LOC in MO.
 Sirius. Path 3 preferred, Path 2 as fallback. ~2000 LOC in MO, ~100 LOC in Sirius.
 All three paths coexist and the router picks the best available.
 
-### 16.10 gRPC Service Definition
+### 17.10 gRPC Service Definition
 
 The sidecar exposes a single gRPC service that serves both Path 2 and Path 3.
 Results are streamed as Arrow IPC record batches for efficient columnar transfer.
@@ -1681,7 +1730,7 @@ private:
 };
 ```
 
-### 16.11 Arrow IPC → MySQL Protocol (Result Conversion)
+### 17.11 Arrow IPC → MySQL Protocol (Result Conversion)
 
 When the sidecar returns Arrow IPC batches, MO must convert them to MySQL wire
 protocol for the client. This section describes the **direct conversion** approach
@@ -1899,7 +1948,7 @@ Sidecar                    MO                         Client
 This gives the client first-row latency equal to one GPU pipeline stage + one
 network hop, not the full query execution time.
 
-### 16.12 Why Not Embed Sirius in MO? (CGO/FFI Infeasibility)
+### 17.12 Why Not Embed Sirius in MO? (CGO/FFI Infeasibility)
 
 A natural question: why not link Sirius as a shared library (`.so`) and call it
 directly from MO via CGO, eliminating the sidecar and gRPC entirely?
@@ -1998,7 +2047,7 @@ The ~0.1ms gRPC latency is negligible compared to GPU execution time (typically
 10ms–10s for analytical queries). The sidecar architecture is strictly superior
 for production use.
 
-### 16.13 MO → Substrait Converter Design (Path 3)
+### 17.13 MO → Substrait Converter Design (Path 3)
 
 This section specifies the Go library that converts MO's internal query plan
 (`pkg/pb/plan.Plan`) to Substrait protobuf bytes consumable by Sirius's
@@ -2860,7 +2909,7 @@ pkg/sql/sirius/
 
 Estimated size: ~2000 LOC Go (converter) + ~200 LOC test.
 
-### 16.14 Monitoring and Observability
+### 17.14 Monitoring and Observability
 
 GPU-accelerated queries span two processes (MO + sidecar) and two hardware domains
 (CPU + GPU). Observability must cover both to diagnose performance issues, failures,
@@ -3100,7 +3149,7 @@ groups:
         annotations: { summary: "p99 GPU query latency above 30s" }
 ```
 
-### 16.15 Security and Authentication
+### 17.15 Security and Authentication
 
 The gRPC channel between MO and the Sirius sidecar carries SQL queries and result
 data. This section specifies the security model for each deployment topology.

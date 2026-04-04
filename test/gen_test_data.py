@@ -1009,6 +1009,28 @@ def main():
     with open(lz4_mf_path, 'w') as f:
         json.dump(lz4_manifest, f, indent=2)
 
+    # Sorted manifest: multi_block.tae with sort_column for ORDER BY pushdown
+    sorted_manifest = {
+        'database': 'test_db',
+        'table': 'test_sorted',
+        'sort_column': 'col_int',
+        'columns': [
+            {'name': 'col_int', 'oid': MO_T_INT32},
+            {'name': 'col_bool', 'oid': MO_T_BOOL},
+        ],
+        'objects': [
+            {
+                'path': os.path.basename(multi_path),
+                'rows': 8,
+                'blocks': 2,
+                'size': os.path.getsize(multi_path),
+            },
+        ],
+    }
+    sorted_mf_path = os.path.join(outdir, 'manifest_sorted.json')
+    with open(sorted_mf_path, 'w') as f:
+        json.dump(sorted_manifest, f, indent=2)
+
     print(f'Generated test data in {outdir}/')
     print(f'  {os.path.basename(basic_path)}  ({os.path.getsize(basic_path)} bytes)')
     print(f'  {os.path.basename(part2_path)}  ({os.path.getsize(part2_path)} bytes)')
@@ -1022,6 +1044,7 @@ def main():
     print(f'  manifest_constants.json')
     print(f'  manifest_types.json')
     print(f'  manifest_lz4.json')
+    print(f'  manifest_sorted.json')
 
 
 if __name__ == '__main__':

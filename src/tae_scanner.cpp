@@ -25,10 +25,13 @@
 #include "duckdb/common/constants.hpp"
 #include "duckdb/common/table_column.hpp"
 #include "duckdb/parser/parsed_data/sample_options.hpp"
+#include "duckdb/storage/table/row_group_reorderer.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <filesystem>
+#include <unordered_map>
 
 // Minimal JSON parsing (header-only, bundled with DuckDB)
 #include "yyjson.hpp"
@@ -112,7 +115,39 @@ static void ParseManifest(const std::string &manifest_path,
         bind.total_blocks += o.blocks;
     }
 
+    // Parse optional sort_column (the PK or sort key column name)
+    yyjson_val *sort_col = yyjson_obj_get(root, "sort_column");
+    if (sort_col && yyjson_is_str(sort_col)) {
+        std::string sort_name = yyjson_get_str(sort_col);
+        for (size_t i = 0; i < bind.all_col_names.size(); i++) {
+            if (bind.all_col_names[i] == sort_name) {
+                bind.sort_column_idx = static_cast<int32_t>(i);
+                break;
+            }
+        }
+    }
+
     yyjson_doc_free(doc);
+}
+
+// ===================================================================
+// SetScanOrder — receive ORDER BY pushdown from DuckDB optimizer
+// ===================================================================
+// Called by the RowGroupPruner optimizer when it detects ORDER BY ... LIMIT N.
+// We extract the relevant fields and store them in bind_data for Init to use.
+static void TAESetScanOrder(duckdb::unique_ptr<duckdb::RowGroupOrderOptions> options,
+                             duckdb::optional_ptr<duckdb::FunctionData> bind_data_p) {
+    if (!bind_data_p || !options) return;
+    auto &bind = bind_data_p->Cast<TAEScanBindData>();
+
+    auto info = std::make_unique<ScanOrderInfo>();
+    info->column_idx = options->column_idx.GetPrimaryIndex();
+    info->ascending = (options->order_type == duckdb::OrderType::ASCENDING);
+    info->use_min_stat = (options->order_by == duckdb::OrderByStatistics::MIN);
+    info->is_string = (options->column_type == duckdb::OrderByColumnType::STRING);
+    info->row_limit = options->row_limit.IsValid() ? options->row_limit.GetIndex() : 0;
+
+    bind.scan_order = std::move(info);
 }
 
 // ===================================================================
@@ -213,6 +248,89 @@ TAEScanInit(duckdb::ClientContext &context,
     for (uint32_t obj = 0; obj < bind.objects.size(); obj++) {
         for (uint32_t blk = 0; blk < bind.objects[obj].blocks; blk++) {
             state->work_units.push_back({obj, blk});
+        }
+    }
+
+    // ORDER BY pushdown: sort work units by zone map of the order column
+    if (bind.scan_order && !state->work_units.empty()) {
+        auto &order = *bind.scan_order;
+        if (order.column_idx < bind.all_col_mo_oids.size()) {
+            uint16_t order_seqnum = static_cast<uint16_t>(order.column_idx);
+            auto mo_oid = static_cast<MOTypeOid>(bind.all_col_mo_oids[order.column_idx]);
+            auto &col_type = bind.all_col_types[order.column_idx];
+
+            // Read zone map sort key for each work unit
+            struct SortableUnit {
+                size_t idx;
+                duckdb::Value key;
+            };
+            std::vector<SortableUnit> sortable;
+            sortable.reserve(state->work_units.size());
+
+            // Cache readers per object to avoid re-opening
+            std::unordered_map<uint32_t, std::unique_ptr<TAEObjectReader>> readers;
+
+            for (size_t i = 0; i < state->work_units.size(); i++) {
+                auto &wu = state->work_units[i];
+
+                auto it = readers.find(wu.object_idx);
+                if (it == readers.end()) {
+                    auto &fs = duckdb::FileSystem::GetFileSystem(context);
+                    auto path = std::filesystem::path(bind.data_dir) /
+                                bind.objects[wu.object_idx].file_path;
+                    auto reader = std::make_unique<TAEObjectReader>(fs, path.string());
+                    reader->ReadMeta();
+                    it = readers.emplace(wu.object_idx, std::move(reader)).first;
+                }
+
+                const uint8_t *zm = it->second->GetZoneMap(wu.block_idx, order_seqnum);
+                duckdb::Value key;
+                if (zm) {
+                    const uint8_t *ptr = zm + (order.use_min_stat ? ZM_MIN_OFF : ZM_MAX_OFF);
+                    key = order.is_string
+                        ? duckdb::Value(ZoneMapBytesToString(ptr))
+                        : ZoneMapBytesToValue(ptr, mo_oid, col_type);
+                }
+                sortable.push_back({i, std::move(key)});
+            }
+
+            // Sort: nulls go to the end regardless of direction
+            if (order.ascending) {
+                std::sort(sortable.begin(), sortable.end(),
+                    [](const SortableUnit &a, const SortableUnit &b) {
+                        if (a.key.IsNull()) return false;
+                        if (b.key.IsNull()) return true;
+                        return a.key < b.key;
+                    });
+            } else {
+                std::sort(sortable.begin(), sortable.end(),
+                    [](const SortableUnit &a, const SortableUnit &b) {
+                        if (a.key.IsNull()) return true;
+                        if (b.key.IsNull()) return false;
+                        return a.key > b.key;
+                    });
+            }
+
+            // Reorder work_units
+            auto old_units = std::move(state->work_units);
+            state->work_units.reserve(sortable.size());
+            for (auto &su : sortable) {
+                state->work_units.push_back(old_units[su.idx]);
+            }
+
+            // Truncate if row_limit allows early termination
+            if (order.row_limit > 0) {
+                duckdb::idx_t rows_available = 0;
+                for (size_t i = 0; i < state->work_units.size(); i++) {
+                    auto &wu = state->work_units[i];
+                    auto it = readers.find(wu.object_idx);
+                    rows_available += it->second->BlockRowCount(wu.block_idx);
+                    if (rows_available >= order.row_limit) {
+                        state->work_units.resize(i + 1);
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -388,9 +506,9 @@ TAEScanStatistics(duckdb::ClientContext &context,
                 const uint8_t *zm = reader.GetZoneMap(blk, seqnum);
                 if (!zm) continue;
 
-                // zone map layout: [min 32B][max 32B][has_null 1B][...] = 64 bytes
-                const uint8_t *zm_min = zm;
-                const uint8_t *zm_max = zm + 32;
+                // zone map layout: min at offset 0, max at offset ZM_MAX_OFF (31)
+                const uint8_t *zm_min = zm + ZM_MIN_OFF;
+                const uint8_t *zm_max = zm + ZM_MAX_OFF;
 
                 if (IsStringType(oid)) {
                     auto min_str = ZoneMapBytesToString(zm_min);
@@ -586,6 +704,7 @@ duckdb::TableFunction GetTAEScanFunction() {
     func.get_virtual_columns = TAEScanGetVirtualColumns;
     func.supports_pushdown_type = TAEScanSupportsPushdownType;
     func.sampling_pushdown = true;
+    func.set_scan_order = TAESetScanOrder;
 
     return func;
 }

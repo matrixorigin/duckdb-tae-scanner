@@ -1,0 +1,23 @@
+{
+  "database": "test_db",
+  "table": "test_sorted",
+  "sort_column": "col_int",
+  "columns": [
+    {
+      "name": "col_int",
+      "oid": 22
+    },
+    {
+      "name": "col_bool",
+      "oid": 10
+    }
+  ],
+  "objects": [
+    {
+      "path": "multi_block.tae",
+      "rows": 8,
+      "blocks": 2,
+      "size": 1593
+    }
+  ]
+}

@@ -59,6 +59,17 @@ struct WorkUnit {
 };
 
 // ---------------------------------------------------------------------------
+// ORDER BY pushdown info (extracted from DuckDB RowGroupOrderOptions)
+// ---------------------------------------------------------------------------
+struct ScanOrderInfo {
+    duckdb::idx_t column_idx;  // table column index to sort by
+    bool ascending;            // ASC or DESC
+    bool use_min_stat;         // sort by min (ASC) or max (DESC) zone map stat
+    bool is_string;            // string vs numeric comparison
+    duckdb::idx_t row_limit;   // 0 = no limit
+};
+
+// ---------------------------------------------------------------------------
 // Bind data — schema + object list, computed once per query (const after bind)
 // ---------------------------------------------------------------------------
 struct TAEScanBindData : public duckdb::TableFunctionData {
@@ -75,6 +86,12 @@ struct TAEScanBindData : public duckdb::TableFunctionData {
     std::vector<TAEObjectInfo>     objects;
     duckdb::idx_t                  total_rows = 0;   // sum of all objects' row counts
     duckdb::idx_t                  total_blocks = 0;  // sum of all objects' block counts
+
+    // Sort column from manifest (optional, -1 = unspecified)
+    int32_t sort_column_idx = -1;
+
+    // ORDER BY pushdown from DuckDB optimizer (set before Init)
+    std::unique_ptr<ScanOrderInfo> scan_order;
 };
 
 // ---------------------------------------------------------------------------
