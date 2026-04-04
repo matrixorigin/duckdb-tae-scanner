@@ -40,8 +40,10 @@ except ImportError:
 # ---------------------------------------------------------------------------
 MO_TYPE_MAP = {
     # SQL type string -> (oid, default_width)
+    # OIDs must match pkg/container/types/types.go T enum values
     "BOOL":       (10, 1),
     "BOOLEAN":    (10, 1),
+    "BIT":        (11, 8),
     "TINYINT":    (20, 1),
     "INT8":       (20, 1),
     "SMALLINT":   (21, 2),
@@ -64,25 +66,23 @@ MO_TYPE_MAP = {
     "FLOAT32":    (30, 4),
     "DOUBLE":     (31, 8),
     "FLOAT64":    (31, 8),
-    "CHAR":       (40, 24),
-    "VARCHAR":    (41, 24),
-    "BLOB":       (43, 24),
-    "TEXT":       (44, 24),
-    "BINARY":     (46, 24),
-    "VARBINARY":  (47, 24),
-    "DATALINK":   (48, 24),
+    "DECIMAL":    (32, 8),   # decimal64 by default, decimal128 for large precision
+    "DECIMAL64":  (32, 8),
+    "DECIMAL128": (33, 16),
+    "CHAR":       (60, 24),
+    "VARCHAR":    (61, 24),
+    "JSON":       (62, 24),
+    "UUID":       (63, 16),
+    "BINARY":     (64, 24),
+    "VARBINARY":  (65, 24),
+    "ENUM":       (66, 2),
+    "BLOB":       (70, 24),
+    "TEXT":       (71, 24),
+    "DATALINK":   (72, 24),
     "DATE":       (50, 4),
     "TIME":       (51, 8),
     "DATETIME":   (52, 8),
     "TIMESTAMP":  (53, 8),
-    "DECIMAL":    (60, 8),   # decimal64 by default, decimal128 for large precision
-    "DECIMAL64":  (60, 8),
-    "DECIMAL128": (61, 16),
-    "DECIMAL256": (62, 32),
-    "UUID":       (100, 16),
-    "JSON":       (201, 24),
-    "ENUM":       (200, 2),
-    "BIT":        (210, 8),
 }
 
 
@@ -120,7 +120,7 @@ def parse_sql_type(type_str: str) -> dict:
 
     # For DECIMAL, decide between decimal64 and decimal128
     if base_type == "DECIMAL" and width > 18:
-        oid = 61  # decimal128
+        oid = 33  # decimal128
         default_width = 16
 
     return {
