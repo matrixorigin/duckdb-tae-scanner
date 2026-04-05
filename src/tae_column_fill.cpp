@@ -7,7 +7,7 @@
 #include "tae_types.hpp"
 
 #include "duckdb/common/types/uuid.hpp"
-#include "duckdb/common/vector/constant_vector.hpp"
+#include "duckdb/common/types/vector.hpp"
 
 #include <cstring>
 

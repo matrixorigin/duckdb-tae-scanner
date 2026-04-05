@@ -1,43 +1,23 @@
-cmake_minimum_required(VERSION 3.14)
-project(tae_scanner VERSION 0.1.0 LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.5)
 
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(TARGET_NAME tae_scanner)
+set(EXTENSION_NAME ${TARGET_NAME}_extension)
+set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
-# ---------------------------------------------------------------------------
-# DuckDB — expects DUCKDB_DIR to point at a DuckDB source/install tree
-# ---------------------------------------------------------------------------
-if(NOT DEFINED DUCKDB_DIR)
-    message(FATAL_ERROR "Set -DDUCKDB_DIR=<path-to-duckdb> (source or install root)")
-endif()
+project(${TARGET_NAME})
 
-# Try find_package first (installed DuckDB), fallback to source tree
-find_package(DuckDB QUIET HINTS ${DUCKDB_DIR})
-if(NOT DuckDB_FOUND)
-    # Source-tree: add as subdirectory
-    if(EXISTS ${DUCKDB_DIR}/CMakeLists.txt)
-        add_subdirectory(${DUCKDB_DIR} duckdb_build EXCLUDE_FROM_ALL)
-        set(DUCKDB_INCLUDE_DIRS
-            ${DUCKDB_DIR}/src/include
-            ${DUCKDB_DIR}/third_party/yyjson/include
-        )
-        set(DUCKDB_LIBRARIES duckdb)
-    else()
-        # Headers + lib in install prefix
-        set(DUCKDB_INCLUDE_DIRS ${DUCKDB_DIR}/include)
-        find_library(DUCKDB_LIBRARIES NAMES duckdb HINTS ${DUCKDB_DIR}/lib)
-        if(NOT DUCKDB_LIBRARIES)
-            message(FATAL_ERROR "Cannot find DuckDB library in ${DUCKDB_DIR}/lib")
-        endif()
-    endif()
-else()
-    get_target_property(DUCKDB_INCLUDE_DIRS DuckDB::DuckDB INTERFACE_INCLUDE_DIRECTORIES)
-    set(DUCKDB_LIBRARIES DuckDB::DuckDB)
-endif()
+include_directories(include)
+
+set(EXTENSION_SOURCES
+    src/tae_column_fill.cpp
+    src/tae_filter.cpp
+    src/tae_object_reader.cpp
+    src/tae_scanner.cpp
+    src/tae_scanner_extension.cpp
+)
 
 # ---------------------------------------------------------------------------
-# LZ4
+# LZ4 dependency
 # ---------------------------------------------------------------------------
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
@@ -52,40 +32,27 @@ if(NOT LZ4_FOUND)
 endif()
 
 # ---------------------------------------------------------------------------
-# Extension shared library
+# Build extension using DuckDB's extension build system
 # ---------------------------------------------------------------------------
-add_library(tae_scanner SHARED
-    src/tae_column_fill.cpp
-    src/tae_filter.cpp
-    src/tae_object_reader.cpp
-    src/tae_scanner.cpp
-    src/tae_scanner_extension.cpp
-)
+build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
+build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
-target_include_directories(tae_scanner PRIVATE
-    ${CMAKE_SOURCE_DIR}/include
-    ${DUCKDB_INCLUDE_DIRS}
-    ${LZ4_INCLUDE_DIRS}
-)
+# Use C++17 for std::filesystem (DuckDB defaults to C++11)
+set_target_properties(${EXTENSION_NAME} PROPERTIES CXX_STANDARD 17)
+set_target_properties(${LOADABLE_EXTENSION_NAME} PROPERTIES CXX_STANDARD 17)
 
-target_link_libraries(tae_scanner PRIVATE
-    ${DUCKDB_LIBRARIES}
-    ${LZ4_LIBRARIES}
-)
+# Link LZ4 and stdc++fs to both static and loadable targets
+target_link_libraries(${EXTENSION_NAME} ${LZ4_LIBRARIES} stdc++fs)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} ${LZ4_LIBRARIES} stdc++fs)
 
-# DuckDB extension naming convention
-set_target_properties(tae_scanner PROPERTIES
-    PREFIX ""
-    OUTPUT_NAME "tae_scanner"
-)
-
-# ---------------------------------------------------------------------------
-# Tests (opt-in via BUILD_TESTS or when top-level project)
-# ---------------------------------------------------------------------------
-option(BUILD_TESTS "Build Catch2 unit tests" ON)
-if(BUILD_TESTS)
-    add_subdirectory(test)
+if(LZ4_INCLUDE_DIRS)
+    target_include_directories(${EXTENSION_NAME} PRIVATE ${LZ4_INCLUDE_DIRS})
+    target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE ${LZ4_INCLUDE_DIRS})
 endif()
 
-# Install
-install(TARGETS tae_scanner LIBRARY DESTINATION lib)
+install(
+    TARGETS ${EXTENSION_NAME}
+    EXPORT "${DUCKDB_EXPORT_SET}"
+    LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
+    ARCHIVE DESTINATION "${INSTALL_LIB_DIR}"
+)

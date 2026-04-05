@@ -17,7 +17,7 @@
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/function/table_function.hpp"
-#include "duckdb/planner/table_filter_set.hpp"
+#include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/statistics/numeric_stats.hpp"
@@ -253,9 +253,9 @@ TAEScanInit(duckdb::ClientContext &context,
     // entry.GetIndex() is a position in column_ids; we map it to
     // the decoded_cols position via col_ids_to_decoded.
     if (input.filters) {
-        for (auto &entry : *input.filters) {
-            auto ci = static_cast<duckdb::idx_t>(entry.GetIndex());
-            auto &filter = entry.Filter();
+        for (auto &entry : input.filters->filters) {
+            auto ci = static_cast<duckdb::idx_t>(entry.first);
+            auto &filter = *entry.second;
             if (ci >= input.column_ids.size()) continue;
 
             auto id = static_cast<duckdb::column_t>(input.column_ids[ci]);
