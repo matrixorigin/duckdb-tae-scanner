@@ -18,7 +18,9 @@ A DuckDB extension that reads [MatrixOne](https://github.com/matrixorigin/matrix
 - **Virtual columns** — exposes `file_path` and `block_id` as virtual columns for provenance tracking
 - **Sampling pushdown** — supports `TABLESAMPLE SYSTEM(N%)` via Bernoulli sampling in the scan
 - **Parallel block scanning** — multi-threaded execution with atomic work dispatch
-- **Planner statistics** — provides row-count estimates and column-level min/max from zone maps
+- **Planner statistics** — provides row-count estimates and column-level min/max from zone maps for optimizer pruning
+- **count(\*) metadata fast path** — resolves `SELECT count(*)` from manifest metadata with zero file I/O
+- **Targeted CRC reads** — reads only the needed bytes from CRC-wrapped files instead of stripping the entire file
 - **posix_fadvise prefetching** — `FADV_SEQUENTIAL` at open + `FADV_WILLNEED` look-ahead for next block
 - **EXPLAIN integration** — shows table name, object count, row count, blocks scanned/skipped in query plans
 

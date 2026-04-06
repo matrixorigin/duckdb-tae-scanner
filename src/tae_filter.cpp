@@ -346,7 +346,8 @@ static bool RowPassesFilter(const PushedFilter &pf, const DecodedColumn &col,
 duckdb::idx_t ApplyRowFilters(const std::vector<PushedFilter> &filters,
                                const std::vector<DecodedColumn> &decoded_cols,
                                duckdb::DataChunk &output,
-                               duckdb::idx_t row_count) {
+                               duckdb::idx_t row_count,
+                               duckdb::idx_t src_offset) {
     if (filters.empty()) return row_count;
 
     duckdb::SelectionVector sel(row_count);
@@ -356,7 +357,7 @@ duckdb::idx_t ApplyRowFilters(const std::vector<PushedFilter> &filters,
         bool pass = true;
         for (auto &pf : filters) {
             if (pf.col_idx >= decoded_cols.size()) continue;
-            if (!RowPassesFilter(pf, decoded_cols[pf.col_idx], row)) {
+            if (!RowPassesFilter(pf, decoded_cols[pf.col_idx], src_offset + row)) {
                 pass = false;
                 break;
             }
@@ -423,12 +424,14 @@ duckdb::Value ZoneMapBytesToValue(const uint8_t *ptr, MOTypeOid oid,
     }
 }
 
-std::string ZoneMapBytesToString(const uint8_t *ptr) {
-    auto *v = reinterpret_cast<const Varlena *>(ptr);
-    if (v->is_inline()) {
-        return std::string(v->inline_data(), v->inline_length());
-    }
-    return std::string(v->inline_data(), 23);
+// Convert zone map min/max bytes to a std::string.
+// Zone map layout: bytes [0..29] = raw value, length stored separately.
+// For min: length is at byte offset ZM_MIN_LEN_OFF (30) from the zone map start.
+// For max: length is at byte offset ZM_MAX_INFO_OFF (61) from the zone map start.
+// We receive a pointer to the start of the value (offset 0 or 31 in the zm).
+// The caller must provide the length separately.
+std::string ZoneMapBytesToString(const uint8_t *ptr, uint32_t len) {
+    return std::string(reinterpret_cast<const char *>(ptr), len);
 }
 
 } // namespace tae

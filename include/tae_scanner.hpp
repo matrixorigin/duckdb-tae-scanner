@@ -146,6 +146,16 @@ struct TAEScanLocalState : public duckdb::LocalTableFunctionState {
     std::unique_ptr<TAEObjectReader> reader;
     uint32_t                         reader_object_idx = UINT32_MAX;
 
+    // Buffered decoded columns from the current block.
+    // MO blocks have 8192 rows but DuckDB STANDARD_VECTOR_SIZE is 2048,
+    // so we emit the block in multiple Execute calls.
+    std::vector<DecodedColumn>       pending_cols;
+    duckdb::idx_t                    pending_total_rows = 0;
+    duckdb::idx_t                    pending_offset = 0;
+    // Saved work unit info for the pending block
+    uint32_t                         pending_object_idx = UINT32_MAX;
+    uint32_t                         pending_block_idx = 0;
+
     // Per-thread RNG for Bernoulli sampling
     std::mt19937_64                  rng{std::random_device{}()};
     std::uniform_real_distribution<double> dist{0.0, 1.0};

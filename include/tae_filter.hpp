@@ -27,17 +27,19 @@ bool BlockPassesFilters(const std::vector<PushedFilter> &filters,
 
 // Apply all pushed filters per-row, compacting the output chunk.
 // Returns new row count after filtering.
+// `src_offset` is the row offset into decoded_cols for chunked output.
 duckdb::idx_t ApplyRowFilters(const std::vector<PushedFilter> &filters,
                                const std::vector<DecodedColumn> &decoded_cols,
                                duckdb::DataChunk &output,
-                               duckdb::idx_t row_count);
+                               duckdb::idx_t row_count,
+                               duckdb::idx_t src_offset = 0);
 
 // Decode a fixed-width zone-map value to a DuckDB Value.
 duckdb::Value ZoneMapBytesToValue(const uint8_t *ptr, MOTypeOid oid,
                                    const duckdb::LogicalType &col_type);
 
 // Decode a string zone-map value (first 32 bytes = varlena-style prefix).
-std::string ZoneMapBytesToString(const uint8_t *ptr);
+std::string ZoneMapBytesToString(const uint8_t *ptr, uint32_t len);
 
 // Check if a raw 64-byte zone map passes a set of filters for a specific seqnum.
 // Used for object-level sort key zone maps (not tied to a reader).

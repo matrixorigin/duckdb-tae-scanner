@@ -220,6 +220,9 @@ public:
 
 private:
     std::vector<uint8_t> ReadBytes(uint64_t offset, uint64_t length);
+    std::vector<uint8_t> ReadRawBytes(uint64_t offset, uint64_t length);
+    void DetectCrcFormat();
+    static std::vector<uint8_t> StripCrc32Blocks(const uint8_t *raw, uint64_t raw_size);
     static std::vector<uint8_t> DecompressLZ4(const uint8_t *src, uint32_t src_len,
                                                uint32_t origin_size);
     static DecodedColumn DecodeVector(const uint8_t *buf, uint32_t len);
@@ -240,6 +243,13 @@ private:
     uint64_t                                prefetch_threshold_ = 4 * 1024 * 1024;
     bool                                    prefetch_attempted_ = false;
     std::vector<uint8_t>                    prefetch_buf_;
+    // CRC32 block format: MO LocalFS wraps every 2048 bytes as [4B CRC32][2044B content]
+    static constexpr uint32_t CRC_BLOCK_SIZE   = 2048;
+    static constexpr uint32_t CRC_SIZE         = 4;
+    static constexpr uint32_t CRC_CONTENT_SIZE = 2044;
+    bool                                    crc_block_format_ = false;
+    bool                                    format_detected_ = false;
+    bool                                    crc_stripped_ = false;
     // Advisory fd for posix_fadvise (Linux only, -1 if unavailable)
     int                                     advise_fd_ = -1;
 };

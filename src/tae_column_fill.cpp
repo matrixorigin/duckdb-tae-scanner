@@ -15,17 +15,20 @@ namespace tae {
 
 static void CopyFixedColumn(duckdb::Vector &out_vec,
                              const DecodedColumn &col,
-                             duckdb::idx_t count) {
+                             duckdb::idx_t count,
+                             duckdb::idx_t src_offset) {
     auto elem_size = MOTypeFixedSize(static_cast<MOTypeOid>(col.type.oid));
     if (elem_size <= 0) return;
     auto *dst = duckdb::FlatVector::GetData(out_vec);
-    memcpy(dst, col.data.data(), count * static_cast<size_t>(elem_size));
+    memcpy(dst, col.data.data() + src_offset * static_cast<size_t>(elem_size),
+           count * static_cast<size_t>(elem_size));
 }
 
 static void CopyDateColumn(duckdb::Vector &out_vec,
                             const DecodedColumn &col,
-                            duckdb::idx_t count) {
-    auto *src = reinterpret_cast<const int32_t *>(col.data.data());
+                            duckdb::idx_t count,
+                            duckdb::idx_t src_offset) {
+    auto *src = reinterpret_cast<const int32_t *>(col.data.data()) + src_offset;
     auto *dst = duckdb::FlatVector::GetData<int32_t>(out_vec);
     for (duckdb::idx_t i = 0; i < count; i++) {
         dst[i] = src[i] - MO_UNIX_EPOCH_DAYS;
@@ -34,8 +37,9 @@ static void CopyDateColumn(duckdb::Vector &out_vec,
 
 static void CopyTimestampColumn(duckdb::Vector &out_vec,
                                  const DecodedColumn &col,
-                                 duckdb::idx_t count) {
-    auto *src = reinterpret_cast<const int64_t *>(col.data.data());
+                                 duckdb::idx_t count,
+                                 duckdb::idx_t src_offset) {
+    auto *src = reinterpret_cast<const int64_t *>(col.data.data()) + src_offset;
     auto *dst = duckdb::FlatVector::GetData<int64_t>(out_vec);
     for (duckdb::idx_t i = 0; i < count; i++) {
         dst[i] = src[i] - MO_UNIX_EPOCH_USEC;
@@ -44,8 +48,9 @@ static void CopyTimestampColumn(duckdb::Vector &out_vec,
 
 static void CopyVarlenColumn(duckdb::Vector &out_vec,
                               const DecodedColumn &col,
-                              duckdb::idx_t count) {
-    auto *src = reinterpret_cast<const Varlena *>(col.data.data());
+                              duckdb::idx_t count,
+                              duckdb::idx_t src_offset) {
+    auto *src = reinterpret_cast<const Varlena *>(col.data.data()) + src_offset;
     const uint8_t *area = col.area.data();
 
     for (duckdb::idx_t i = 0; i < count; i++) {
@@ -77,9 +82,10 @@ static void CopyVarlenColumn(duckdb::Vector &out_vec,
 // DuckDB stores UUID as hugeint_t with MSB flipped for sort order.
 static void CopyUuidColumn(duckdb::Vector &out_vec,
                             const DecodedColumn &col,
-                            duckdb::idx_t count) {
+                            duckdb::idx_t count,
+                            duckdb::idx_t src_offset) {
     auto *dst = duckdb::FlatVector::GetData<duckdb::hugeint_t>(out_vec);
-    const uint8_t *src = col.data.data();
+    const uint8_t *src = col.data.data() + src_offset * 16;
     for (duckdb::idx_t i = 0; i < count; i++) {
         dst[i] = duckdb::UUID::FromBlob(src + i * 16);
     }
@@ -87,12 +93,14 @@ static void CopyUuidColumn(duckdb::Vector &out_vec,
 
 static void SetNullMask(duckdb::Vector &out_vec,
                          const DecodedColumn &col,
-                         duckdb::idx_t count) {
+                         duckdb::idx_t count,
+                         duckdb::idx_t src_offset) {
     if (col.null_count == 0) return;
     auto &validity = duckdb::FlatVector::Validity(out_vec);
     for (duckdb::idx_t i = 0; i < count; i++) {
-        uint64_t word_idx = i / 64;
-        uint64_t bit_idx = i % 64;
+        uint64_t src_row = src_offset + i;
+        uint64_t word_idx = src_row / 64;
+        uint64_t bit_idx = src_row % 64;
         if (word_idx < col.null_bitmap.size() &&
             (col.null_bitmap[word_idx] & (1ULL << bit_idx))) {
             validity.SetInvalid(i);
@@ -184,7 +192,8 @@ static void FillConstantColumn(duckdb::Vector &out_vec,
 
 void FillColumn(duckdb::Vector &out_vec,
                 const DecodedColumn &col,
-                duckdb::idx_t count) {
+                duckdb::idx_t count,
+                duckdb::idx_t src_offset) {
     // CONSTANT vector: single value for all rows
     if (col.vec_class == 1) {
         FillConstantColumn(out_vec, col);
@@ -194,11 +203,11 @@ void FillColumn(duckdb::Vector &out_vec,
     // FLAT vector: per-row data
     switch (static_cast<MOTypeOid>(col.type.oid)) {
     case MO_T_date:
-        CopyDateColumn(out_vec, col, count);
+        CopyDateColumn(out_vec, col, count, src_offset);
         break;
     case MO_T_datetime:
     case MO_T_timestamp:
-        CopyTimestampColumn(out_vec, col, count);
+        CopyTimestampColumn(out_vec, col, count, src_offset);
         break;
     case MO_T_char:
     case MO_T_varchar:
@@ -208,16 +217,16 @@ void FillColumn(duckdb::Vector &out_vec,
     case MO_T_binary:
     case MO_T_varbinary:
     case MO_T_datalink:
-        CopyVarlenColumn(out_vec, col, count);
+        CopyVarlenColumn(out_vec, col, count, src_offset);
         break;
     case MO_T_uuid:
-        CopyUuidColumn(out_vec, col, count);
+        CopyUuidColumn(out_vec, col, count, src_offset);
         break;
     default:
-        CopyFixedColumn(out_vec, col, count);
+        CopyFixedColumn(out_vec, col, count, src_offset);
         break;
     }
-    SetNullMask(out_vec, col, count);
+    SetNullMask(out_vec, col, count, src_offset);
 }
 
 } // namespace tae

@@ -27,9 +27,12 @@
 #include "duckdb/parser/parsed_data/sample_options.hpp"
 #include "duckdb/storage/table/row_group_reorderer.hpp"
 
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/common/file_open_flags.hpp"
+#include "duckdb/main/client_context.hpp"
+
 #include <algorithm>
 #include <cstring>
-#include <fstream>
 #include <filesystem>
 #include <unordered_map>
 
@@ -74,15 +77,17 @@ static std::vector<uint8_t> HexDecode(const char *hex, size_t len) {
 //       {"path":"018e.../00001", "rows":8192, "blocks":1, "size":131072}, ...
 //     ]
 //   }
-static void ParseManifest(const std::string &manifest_path,
+static void ParseManifest(duckdb::ClientContext &context,
+                           const std::string &manifest_path,
                            TAEScanBindData &bind) {
-    // Read entire file
-    std::ifstream ifs(manifest_path);
-    if (!ifs.is_open()) {
-        throw std::runtime_error("tae_scan: cannot open manifest: " + manifest_path);
-    }
-    std::string json_str((std::istreambuf_iterator<char>(ifs)),
-                          std::istreambuf_iterator<char>());
+    // Read manifest via DuckDB FileSystem (supports local files and HTTP URLs)
+    auto &fs = duckdb::FileSystem::GetFileSystem(context);
+    auto file_handle = fs.OpenFile(manifest_path,
+                                   duckdb::FileFlags::FILE_FLAGS_READ);
+    auto file_size = file_handle->GetFileSize();
+    std::string json_str(file_size, '\0');
+    file_handle->Read(const_cast<char *>(json_str.data()), file_size);
+    file_handle->Close();
 
     yyjson_doc *doc = yyjson_read(json_str.c_str(), json_str.size(), 0);
     if (!doc) throw std::runtime_error("tae_scan: invalid JSON in manifest");
@@ -94,6 +99,12 @@ static void ParseManifest(const std::string &manifest_path,
     yyjson_val *tbl_val = yyjson_obj_get(root, "table");
     if (db_val)  bind.db_name    = yyjson_get_str(db_val);
     if (tbl_val) bind.table_name = yyjson_get_str(tbl_val);
+
+    // Data directory from manifest (where object files are stored)
+    yyjson_val *dir_val = yyjson_obj_get(root, "data_dir");
+    if (dir_val && yyjson_is_str(dir_val)) {
+        bind.data_dir = yyjson_get_str(dir_val);
+    }
 
     // Columns
     yyjson_val *cols = yyjson_obj_get(root, "columns");
@@ -191,11 +202,17 @@ TAEScanBind(duckdb::ClientContext &context,
     auto bind_data = duckdb::make_uniq<TAEScanBindData>();
     auto manifest_path = input.inputs[0].GetValue<std::string>();
 
-    // Parse the manifest JSON
-    ParseManifest(manifest_path, *bind_data);
+    // Parse the manifest JSON (supports local files and HTTP URLs)
+    ParseManifest(context, manifest_path, *bind_data);
 
-    // Derive data_dir from manifest file location
-    bind_data->data_dir = std::filesystem::path(manifest_path).parent_path().string();
+    // Use data_dir from manifest if present, otherwise derive from manifest location.
+    // For HTTP URLs, data_dir MUST be in the manifest (no parent_path for URLs).
+    if (bind_data->data_dir.empty()) {
+        if (manifest_path.rfind("http://", 0) == 0 || manifest_path.rfind("https://", 0) == 0) {
+            throw std::runtime_error("tae_scan: HTTP manifest must contain 'data_dir' field");
+        }
+        bind_data->data_dir = std::filesystem::path(manifest_path).parent_path().string();
+    }
 
     // Return all columns to DuckDB (projection pushdown will select a subset)
     for (size_t i = 0; i < bind_data->all_col_names.size(); i++) {
@@ -249,6 +266,9 @@ TAEScanInit(duckdb::ClientContext &context,
         }
     }
 
+    // Phase 3: Extract pushed-down filters.
+    // entry.GetIndex() is a position in column_ids; we map it to
+    // the decoded_cols position via col_ids_to_decoded.
     // Phase 3: Extract pushed-down filters.
     // entry.GetIndex() is a position in column_ids; we map it to
     // the decoded_cols position via col_ids_to_decoded.
@@ -382,10 +402,16 @@ TAEScanInit(duckdb::ClientContext &context,
                 const uint8_t *zm = it->second->GetZoneMap(wu.block_idx, order_seqnum);
                 duckdb::Value key;
                 if (zm) {
-                    const uint8_t *ptr = zm + (order.use_min_stat ? ZM_MIN_OFF : ZM_MAX_OFF);
-                    key = order.is_string
-                        ? duckdb::Value(ZoneMapBytesToString(ptr))
-                        : ZoneMapBytesToValue(ptr, mo_oid, col_type);
+                    ZoneMap zmobj(zm);
+                    if (order.use_min_stat) {
+                        key = order.is_string
+                            ? duckdb::Value(ZoneMapBytesToString(zmobj.MinBuf(), zmobj.MinLen()))
+                            : ZoneMapBytesToValue(zmobj.MinBuf(), mo_oid, col_type);
+                    } else {
+                        key = order.is_string
+                            ? duckdb::Value(ZoneMapBytesToString(zmobj.MaxBuf(), zmobj.MaxLen()))
+                            : ZoneMapBytesToValue(zmobj.MaxBuf(), mo_oid, col_type);
+                    }
                 }
                 sortable.push_back({i, std::move(key)});
             }
@@ -443,8 +469,20 @@ TAEScanInitLocal(duckdb::ExecutionContext &context,
     return duckdb::make_uniq<TAEScanLocalState>();
 }
 
+// Compute per-block row count from manifest metadata (no file I/O).
+// All blocks except the last have exactly 8192 rows.
+static inline duckdb::idx_t ManifestBlockRowCount(
+    const TAEObjectInfo &obj, uint32_t block_idx) {
+    constexpr uint32_t ROWS_PER_BLOCK = 8192;
+    if (block_idx + 1 < obj.blocks) return ROWS_PER_BLOCK;
+    return obj.rows - static_cast<duckdb::idx_t>(obj.blocks - 1) * ROWS_PER_BLOCK;
+}
+
 // ===================================================================
 // Execute — parallel scan with atomic work dispatch
+//
+// MO blocks have 8192 rows but DuckDB STANDARD_VECTOR_SIZE is 2048.
+// We buffer decoded columns in local state and emit ≤2048 rows per call.
 // ===================================================================
 static void TAEScanExecute(duckdb::ClientContext &context,
                             duckdb::TableFunctionInput &input,
@@ -454,6 +492,73 @@ static void TAEScanExecute(duckdb::ClientContext &context,
     auto *lstate = input.local_state
                        ? &input.local_state->Cast<TAEScanLocalState>()
                        : nullptr;
+
+    // Fast path: no TAE columns to read and no row filters.
+    // Emit row counts from manifest metadata without any file I/O.
+    // Covers count(*) and virtual-column-only queries.
+    if (gstate.read_seqnums.empty() && gstate.filters.empty() && !gstate.do_sample) {
+        // Drain pending rows from previous call
+        if (lstate && lstate->pending_offset < lstate->pending_total_rows) {
+            goto emit_chunk_fast;
+        }
+        while (true) {
+            auto wu_idx = gstate.next_work_unit.fetch_add(1);
+            if (wu_idx >= gstate.work_units.size()) {
+                output.SetCardinality(0);
+                return;
+            }
+            auto &wu = gstate.work_units[wu_idx];
+            duckdb::idx_t total_rows = ManifestBlockRowCount(
+                bind.objects[wu.object_idx], wu.block_idx);
+            if (lstate) {
+                lstate->pending_total_rows = total_rows;
+                lstate->pending_offset = 0;
+                lstate->pending_object_idx = wu.object_idx;
+                lstate->pending_block_idx = wu.block_idx;
+            } else {
+                duckdb::idx_t chunk_rows = std::min(total_rows,
+                    static_cast<duckdb::idx_t>(STANDARD_VECTOR_SIZE));
+                output.SetCardinality(chunk_rows);
+                gstate.rows_emitted.fetch_add(chunk_rows, std::memory_order_relaxed);
+                return;
+            }
+            goto emit_chunk_fast;
+        }
+
+    emit_chunk_fast:
+        {
+            duckdb::idx_t src_offset = lstate->pending_offset;
+            duckdb::idx_t remaining = lstate->pending_total_rows - src_offset;
+            duckdb::idx_t chunk_rows = std::min(remaining,
+                static_cast<duckdb::idx_t>(STANDARD_VECTOR_SIZE));
+            output.SetCardinality(chunk_rows);
+            // Fill virtual columns only
+            for (duckdb::idx_t i = 0; i < gstate.output_map.size(); i++) {
+                auto &om = gstate.output_map[i];
+                if (om.kind == OutputColumnInfo::VCOL_FILENAME) {
+                    auto fname = bind.objects[lstate->pending_object_idx].file_path;
+                    auto target = duckdb::StringVector::AddString(output.data[i], fname);
+                    auto *data = duckdb::FlatVector::GetData<duckdb::string_t>(output.data[i]);
+                    std::fill_n(data, chunk_rows, target);
+                } else if (om.kind == OutputColumnInfo::VCOL_BLOCK_ID) {
+                    auto *data = duckdb::FlatVector::GetData<int32_t>(output.data[i]);
+                    std::fill_n(data, chunk_rows, static_cast<int32_t>(lstate->pending_block_idx));
+                }
+            }
+            lstate->pending_offset += chunk_rows;
+            if (lstate->pending_offset >= lstate->pending_total_rows) {
+                lstate->pending_total_rows = 0;
+                lstate->pending_offset = 0;
+            }
+            gstate.rows_emitted.fetch_add(chunk_rows, std::memory_order_relaxed);
+            return;
+        }
+    }
+
+    // If we have pending rows from a previous block, emit the next chunk
+    if (lstate && lstate->pending_offset < lstate->pending_total_rows) {
+        goto emit_chunk;
+    }
 
     while (true) {
         // Atomically grab next work unit
@@ -498,7 +603,6 @@ static void TAEScanExecute(duckdb::ClientContext &context,
         gstate.blocks_scanned.fetch_add(1, std::memory_order_relaxed);
 
         // Look-ahead prefetch: hint the OS to start reading the next block
-        // while we process this one. This overlaps I/O with CPU decoding.
         auto peek_idx = gstate.next_work_unit.load(std::memory_order_relaxed);
         if (peek_idx < gstate.work_units.size()) {
             auto &next_wu = gstate.work_units[peek_idx];
@@ -510,47 +614,103 @@ static void TAEScanExecute(duckdb::ClientContext &context,
         auto decoded_cols = reader->ReadBlock(wu.block_idx, gstate.read_seqnums);
         if (decoded_cols.empty() && !gstate.read_seqnums.empty()) continue;
 
-        // Determine row count from first decoded TAE column, or from object metadata
-        duckdb::idx_t row_count = 0;
+        // Determine total row count
+        duckdb::idx_t total_rows = 0;
         if (!decoded_cols.empty()) {
-            row_count = decoded_cols[0].row_count;
+            total_rows = decoded_cols[0].row_count;
         } else {
-            // All output columns are virtual — use block row count from metadata
-            row_count = reader->BlockRowCount(wu.block_idx);
+            total_rows = reader->BlockRowCount(wu.block_idx);
         }
-        output.SetCardinality(row_count);
 
-        // Fill output columns using output_map (decoded_pos indexes decoded_cols)
+        // Store decoded block in local state for chunked emission
+        if (lstate) {
+            lstate->pending_cols = std::move(decoded_cols);
+            lstate->pending_total_rows = total_rows;
+            lstate->pending_offset = 0;
+            lstate->pending_object_idx = wu.object_idx;
+            lstate->pending_block_idx = wu.block_idx;
+        } else {
+            // No local state — emit first STANDARD_VECTOR_SIZE rows only
+            duckdb::idx_t chunk_rows = std::min(total_rows,
+                                                 static_cast<duckdb::idx_t>(STANDARD_VECTOR_SIZE));
+            output.SetCardinality(chunk_rows);
+            for (duckdb::idx_t i = 0; i < gstate.output_map.size(); i++) {
+                auto &om = gstate.output_map[i];
+                if (om.kind == OutputColumnInfo::TAE_COLUMN && om.decoded_pos < decoded_cols.size()) {
+                    FillColumn(output.data[i], decoded_cols[om.decoded_pos], chunk_rows, 0);
+                }
+            }
+            gstate.rows_emitted.fetch_add(chunk_rows, std::memory_order_relaxed);
+            return;
+        }
+
+        // Fall through to emit_chunk
+        goto emit_chunk;
+    }
+
+emit_chunk:
+    {
+        auto &pending_cols = lstate->pending_cols;
+        duckdb::idx_t src_offset = lstate->pending_offset;
+        duckdb::idx_t remaining = lstate->pending_total_rows - src_offset;
+        duckdb::idx_t chunk_rows = std::min(remaining,
+                                             static_cast<duckdb::idx_t>(STANDARD_VECTOR_SIZE));
+
+        output.SetCardinality(chunk_rows);
+
+        // Fill output columns
         for (duckdb::idx_t i = 0; i < gstate.output_map.size(); i++) {
             auto &om = gstate.output_map[i];
             switch (om.kind) {
             case OutputColumnInfo::TAE_COLUMN:
-                if (om.decoded_pos < decoded_cols.size()) {
-                    FillColumn(output.data[i], decoded_cols[om.decoded_pos], row_count);
+                if (om.decoded_pos < pending_cols.size()) {
+                    FillColumn(output.data[i], pending_cols[om.decoded_pos],
+                               chunk_rows, src_offset);
                 }
                 break;
             case OutputColumnInfo::VCOL_FILENAME: {
-                auto fname = bind.objects[wu.object_idx].file_path;
+                auto fname = bind.objects[lstate->pending_object_idx].file_path;
                 auto target = duckdb::StringVector::AddString(output.data[i], fname);
                 auto *data = duckdb::FlatVector::GetData<duckdb::string_t>(output.data[i]);
-                std::fill_n(data, row_count, target);
+                std::fill_n(data, chunk_rows, target);
                 break;
             }
             case OutputColumnInfo::VCOL_BLOCK_ID: {
                 auto *data = duckdb::FlatVector::GetData<int32_t>(output.data[i]);
-                std::fill_n(data, row_count, static_cast<int32_t>(wu.block_idx));
+                std::fill_n(data, chunk_rows, static_cast<int32_t>(lstate->pending_block_idx));
                 break;
             }
             }
         }
 
-        // Apply per-row filtering (zone maps only do block-level skip)
+        // Apply per-row filtering
         duckdb::idx_t filtered_count = ApplyRowFilters(
-            gstate.filters, decoded_cols, output, row_count);
-        if (filtered_count == 0) continue; // all rows filtered out
+            gstate.filters, pending_cols, output, chunk_rows, src_offset);
+
+        // Advance offset
+        lstate->pending_offset += chunk_rows;
+        if (lstate->pending_offset >= lstate->pending_total_rows) {
+            // Block fully emitted — clear pending state
+            lstate->pending_cols.clear();
+            lstate->pending_total_rows = 0;
+            lstate->pending_offset = 0;
+        }
+
+        if (filtered_count == 0) {
+            // All rows in this chunk filtered — try next chunk or block
+            if (lstate->pending_offset < lstate->pending_total_rows) {
+                goto emit_chunk;
+            }
+            // Block exhausted, loop back to grab next work unit
+            // Reset output and continue the main loop
+            output.SetCardinality(0);
+            // We can't easily loop back from here, so just return 0
+            // and let DuckDB call us again
+            return;
+        }
 
         // Apply Bernoulli sampling if requested
-        if (gstate.do_sample && lstate) {
+        if (gstate.do_sample) {
             duckdb::SelectionVector sel(filtered_count);
             duckdb::idx_t sample_count = 0;
             for (duckdb::idx_t i = 0; i < filtered_count; i++) {
@@ -558,7 +718,13 @@ static void TAEScanExecute(duckdb::ClientContext &context,
                     sel.set_index(sample_count++, i);
                 }
             }
-            if (sample_count == 0) continue;
+            if (sample_count == 0) {
+                if (lstate->pending_offset < lstate->pending_total_rows) {
+                    goto emit_chunk;
+                }
+                output.SetCardinality(0);
+                return;
+            }
             output.Slice(sel, sample_count);
             filtered_count = sample_count;
         }
@@ -596,6 +762,13 @@ TAEScanStatistics(duckdb::ClientContext &context,
     auto oid = static_cast<MOTypeOid>(bind.all_col_mo_oids[column_index]);
     uint16_t seqnum = static_cast<uint16_t>(column_index);
 
+    // Skip expensive column statistics for large object counts.
+    // Each object requires reading file metadata (costly for CRC-wrapped files).
+    constexpr size_t MAX_OBJECTS_FOR_STATS = 16;
+    if (bind.objects.size() > MAX_OBJECTS_FOR_STATS) {
+        return nullptr;
+    }
+
     // Open each object and merge zone maps for this column
     bool has_stats = false;
     duckdb::Value global_min, global_max;
@@ -613,12 +786,11 @@ TAEScanStatistics(duckdb::ClientContext &context,
                 if (!zm) continue;
 
                 // zone map layout: min at offset 0, max at offset ZM_MAX_OFF (31)
-                const uint8_t *zm_min = zm + ZM_MIN_OFF;
-                const uint8_t *zm_max = zm + ZM_MAX_OFF;
+                ZoneMap zmobj(zm);
 
                 if (IsStringType(oid)) {
-                    auto min_val = duckdb::Value(ZoneMapBytesToString(zm_min));
-                    auto max_val = duckdb::Value(ZoneMapBytesToString(zm_max));
+                    auto min_val = duckdb::Value(ZoneMapBytesToString(zmobj.MinBuf(), zmobj.MinLen()));
+                    auto max_val = duckdb::Value(ZoneMapBytesToString(zmobj.MaxBuf(), zmobj.MaxLen()));
                     if (!has_stats) {
                         global_min = std::move(min_val);
                         global_max = std::move(max_val);
@@ -628,8 +800,8 @@ TAEScanStatistics(duckdb::ClientContext &context,
                         if (max_val > global_max) global_max = std::move(max_val);
                     }
                 } else {
-                    auto min_val = ZoneMapBytesToValue(zm_min, oid, col_type);
-                    auto max_val = ZoneMapBytesToValue(zm_max, oid, col_type);
+                    auto min_val = ZoneMapBytesToValue(zmobj.MinBuf(), oid, col_type);
+                    auto max_val = ZoneMapBytesToValue(zmobj.MaxBuf(), oid, col_type);
                     if (min_val.IsNull() || max_val.IsNull()) continue;
                     if (!has_stats) {
                         global_min = std::move(min_val);
@@ -680,6 +852,9 @@ TAEScanStatistics(duckdb::ClientContext &context,
         auto max_sv = duckdb::StringValue::Get(global_max);
         duckdb::StringStats::Update(stats, min_sv);
         duckdb::StringStats::Update(stats, max_sv);
+        // Zone map min/max strings may be shorter than actual column values,
+        // so don't advertise max_string_length (which Update sets from these).
+        duckdb::StringStats::ResetMaxStringLength(stats);
         break;
     }
     default:

@@ -942,6 +942,50 @@ MO blocks contain up to 8,192 rows. DuckDB's standard vector size is 2,048. The
 scanner should split MO blocks into DuckDB-sized chunks (4 chunks per block) for
 optimal pipeline utilization.
 
+### 12.6 CRC-Wrapped File Handling
+
+MO wraps TAE object files in a CRC framing format: every 2,044 bytes of logical data
+are stored as a 2,048-byte physical block (4-byte CRC header + 2,044 bytes payload).
+A naive approach strips the entire file on first access, but this is catastrophic for
+metadata-only reads (e.g., statistics callback reads ~4 KB of metadata but would load
+~33 MB per file).
+
+**Targeted CRC reads**: `ReadBytes()` translates each logical `[offset, offset+len)`
+range to the covering physical CRC blocks, reads only those blocks via `pread()`,
+strips CRC headers inline, and returns a contiguous logical buffer. Formula:
+
+```
+first_block = offset / 2044
+last_block  = (offset + len - 1) / 2044
+phys_start  = first_block * 2048
+phys_end    = (last_block + 1) * 2048
+```
+
+For a statistics callback reading 1,018 objects: ~10 MB total I/O instead of 33.6 GB.
+
+### 12.7 count(*) Metadata Fast Path
+
+When the query requires no column data (e.g., `SELECT count(*)`), the Execute phase
+emits row counts directly from manifest metadata without any file I/O:
+
+- **Condition**: `read_seqnums` empty AND `filters` empty AND no sampling
+- **Row counts**: all blocks = 8,192 rows except the last block of each object, which
+  is `total_rows - (blocks - 1) * 8192`
+- **Virtual columns**: `file_path` and `block_id` are filled if projected
+- 600 million rows counted in **0.2 seconds** (was ~327 seconds before targeted CRC fix)
+
+### 12.8 Planner Statistics and String Zone Maps
+
+The `TAEScanStatistics` callback provides DuckDB's optimizer with column-level min/max
+statistics from zone maps. For VARCHAR columns, zone map bytes are raw string bytes
+(not Varlena-encoded), with lengths stored at separate offsets (byte 30 for min, byte
+61 for max). The callback uses `StringStats::Update()` to set truncated 8-byte min/max
+ranges, and calls `ResetMaxStringLength()` since zone map values don't reflect actual
+column data lengths.
+
+A `MAX_OBJECTS_FOR_STATS` cap (default 16) prevents expensive per-object metadata reads
+for large tables — the callback returns `nullptr` and DuckDB falls back to defaults.
+
 ---
 
 ## 13. Phased Implementation Plan
@@ -961,6 +1005,8 @@ optimal pipeline utilization.
 - ✅ Projection pushdown (column pruning)
 - ✅ Parallel block scanning (atomic work dispatch, multi-threaded)
 - ✅ Planner statistics (cardinality + column min/max from zone maps + null info from metadata)
+- ✅ Targeted CRC reads (reads only needed bytes from CRC-wrapped files, not entire file)
+- ✅ count(*) metadata fast path (zero file I/O, resolves from manifest metadata)
 - ✅ Virtual columns (file_path, block_id)
 - ✅ Sampling pushdown (TABLESAMPLE SYSTEM via Bernoulli)
 - ✅ ORDER BY pushdown (set_scan_order: block reorder + limit pruning)
@@ -1354,6 +1400,36 @@ D> CALL gpu_execution('
      GROUP BY l_returnflag, l_linestatus
    ');
 ```
+
+### 14.5 TPC-H SF100 Benchmark Results
+
+Measured on 24-core machine with local NVMe storage, DuckDB CLI (24 threads):
+
+| Query | Wall Time | CPU Time | Description |
+|-------|-----------|----------|-------------|
+| count(*) | 0.2s | — | Metadata fast path, zero file I/O (600M rows) |
+| Q1 | 2.6s | 51s | Single-table aggregation + group by |
+| Q2 | 1.2s | 6s | Correlated subquery, 5-way join |
+| Q3 | 2.8s | 39s | 3-way join (customer/orders/lineitem) |
+| Q4 | 2.4s | 33s | Semi-join (EXISTS subquery) |
+| Q5 | 1.9s | 35s | 6-way join with VARCHAR filter |
+| Q6 | 1.0s | 20s | Single-table scan + multi-column filter |
+| Q7 | 2.2s | 39s | 6-way join, two-nation shipping |
+| Q8 | 2.2s | 39s | 8-way join, market share |
+| Q9 | 8.2s | 121s | 6-way join, LIKE filter, profit calc |
+| Q10 | 4.1s | 57s | 4-way join, returned items |
+| Q11 | 0.2s | 2s | 3-way join, HAVING subquery |
+| Q12 | 3.6s | 45s | 2-way join, shipping mode priority |
+| Q13 | 7.8s | 125s | LEFT OUTER JOIN, NOT LIKE filter |
+| Q14 | 1.5s | 25s | 2-way join, promotion revenue |
+| Q15 | 1.3s | 22s | CTE with max aggregate, top supplier |
+| Q16 | 1.0s | 16s | 2-way join, NOT IN anti-join |
+| Q17 | 1.0s | 18s | Correlated subquery, small parts |
+| Q18 | 6.7s | 99s | 3-way join, HAVING, large quantities |
+| Q19 | 4.0s | 50s | 2-way join, complex OR predicates |
+| Q20 | 1.3s | 21s | Nested subqueries, forest parts |
+| Q21 | 6.5s | 120s | 4-way join, EXISTS + NOT EXISTS |
+| Q22 | 0.8s | 16s | Subquery, NOT EXISTS, global customers |
 
 ---
 

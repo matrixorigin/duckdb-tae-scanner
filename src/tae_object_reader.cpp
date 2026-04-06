@@ -48,7 +48,7 @@ TAEObjectReader::~TAEObjectReader() {
 }
 
 // ---------------------------------------------------------------------------
-// ReadBytes — read raw bytes from file at a given offset
+// ReadRawBytes — read raw physical bytes from file at a given offset
 //
 // If the file fits within prefetch_threshold_, the entire file is read on the
 // first call and cached. All subsequent reads are served from the cache with
@@ -58,7 +58,7 @@ TAEObjectReader::~TAEObjectReader() {
 // For larger files, each call issues a separate FileSystem read.
 // ---------------------------------------------------------------------------
 
-std::vector<uint8_t> TAEObjectReader::ReadBytes(uint64_t offset, uint64_t length) {
+std::vector<uint8_t> TAEObjectReader::ReadRawBytes(uint64_t offset, uint64_t length) {
     // Attempt prefetch on first call
     if (!prefetch_attempted_) {
         prefetch_attempted_ = true;
@@ -82,6 +82,101 @@ std::vector<uint8_t> TAEObjectReader::ReadBytes(uint64_t offset, uint64_t length
 }
 
 // ---------------------------------------------------------------------------
+// DetectCrcFormat — check if file uses MO LocalFS CRC32 block format
+//
+// MO's LocalFS wraps data in 2048-byte blocks: [4B CRC32][2044B content].
+// Raw files (S3, HTTP) have no CRC wrapper.
+// Auto-detect by checking magic position: offset 0 (raw) vs offset 4 (CRC).
+// ---------------------------------------------------------------------------
+
+void TAEObjectReader::DetectCrcFormat() {
+    if (format_detected_) return;
+    format_detected_ = true;
+
+    if (file_size_ < 12) {
+        throw std::runtime_error("file too small: " + std::to_string(file_size_));
+    }
+
+    auto probe = ReadRawBytes(0, 12);
+    uint64_t magic_at_0, magic_at_4;
+    memcpy(&magic_at_0, probe.data(), 8);
+    memcpy(&magic_at_4, probe.data() + 4, 8);
+
+    if (magic_at_0 == OBJECT_MAGIC) {
+        crc_block_format_ = false;
+    } else if (magic_at_4 == OBJECT_MAGIC) {
+        crc_block_format_ = true;
+    } else {
+        throw std::runtime_error("invalid TAE magic: neither raw (" +
+                                 std::to_string(magic_at_0) + ") nor CRC-wrapped (" +
+                                 std::to_string(magic_at_4) + ")");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StripCrc32Blocks — strip CRC32 headers from a raw byte buffer
+//
+// Input: raw bytes in [4B CRC][2044B content] block format
+// Output: contiguous content bytes with CRC headers removed
+// ---------------------------------------------------------------------------
+
+std::vector<uint8_t> TAEObjectReader::StripCrc32Blocks(const uint8_t *raw,
+                                                        uint64_t raw_size) {
+    uint64_t num_blocks = (raw_size + CRC_BLOCK_SIZE - 1) / CRC_BLOCK_SIZE;
+    std::vector<uint8_t> content;
+    content.reserve(num_blocks * CRC_CONTENT_SIZE);
+
+    for (uint64_t off = 0; off < raw_size; off += CRC_BLOCK_SIZE) {
+        uint64_t remaining = raw_size - off;
+        if (remaining <= CRC_SIZE) break;
+        uint32_t content_len = static_cast<uint32_t>(
+            std::min(static_cast<uint64_t>(CRC_CONTENT_SIZE), remaining - CRC_SIZE));
+        content.insert(content.end(),
+                       raw + off + CRC_SIZE,
+                       raw + off + CRC_SIZE + content_len);
+    }
+    return content;
+}
+
+// ---------------------------------------------------------------------------
+// ReadBytes — read logical content bytes (CRC-aware)
+//
+// For raw files: direct passthrough to ReadRawBytes.
+// For CRC-wrapped files: translates logical content offset to physical file
+// offset, reads only the needed CRC blocks, and strips headers inline.
+// ---------------------------------------------------------------------------
+
+std::vector<uint8_t> TAEObjectReader::ReadBytes(uint64_t offset, uint64_t length) {
+    DetectCrcFormat();
+
+    if (!crc_block_format_) {
+        return ReadRawBytes(offset, length);
+    }
+
+    // CRC MODE: targeted read of only the blocks we need
+    uint64_t first_block = offset / CRC_CONTENT_SIZE;
+    uint64_t last_block  = (offset + length - 1) / CRC_CONTENT_SIZE;
+    uint64_t phys_start  = first_block * CRC_BLOCK_SIZE;
+    uint64_t phys_end    = std::min((last_block + 1) * CRC_BLOCK_SIZE, file_size_);
+
+    auto raw = ReadRawBytes(phys_start, phys_end - phys_start);
+    auto stripped = StripCrc32Blocks(raw.data(), raw.size());
+
+    // Slice out the requested logical range
+    uint64_t content_start = first_block * CRC_CONTENT_SIZE;
+    uint64_t local_offset  = offset - content_start;
+
+    if (local_offset + length > stripped.size()) {
+        throw std::runtime_error("CRC read: offset " + std::to_string(offset) +
+                                 " + length " + std::to_string(length) +
+                                 " exceeds stripped range (" +
+                                 std::to_string(stripped.size()) + " bytes)");
+    }
+    return std::vector<uint8_t>(stripped.begin() + local_offset,
+                                 stripped.begin() + local_offset + length);
+}
+
+// ---------------------------------------------------------------------------
 // PrefetchRange — advisory hint for kernel page cache
 // ---------------------------------------------------------------------------
 
@@ -90,8 +185,17 @@ void TAEObjectReader::PrefetchRange(uint64_t offset, uint64_t length) {
     if (!prefetch_buf_.empty()) return;
 #ifdef __linux__
     if (advise_fd_ >= 0 && length > 0) {
-        posix_fadvise(advise_fd_, static_cast<off_t>(offset),
-                      static_cast<off_t>(length), POSIX_FADV_WILLNEED);
+        // Translate to physical offset for CRC format
+        uint64_t phys_offset = offset;
+        uint64_t phys_length = length;
+        if (crc_block_format_) {
+            uint64_t first_block = offset / CRC_CONTENT_SIZE;
+            uint64_t last_block = (offset + length - 1) / CRC_CONTENT_SIZE;
+            phys_offset = first_block * CRC_BLOCK_SIZE;
+            phys_length = (last_block + 1) * CRC_BLOCK_SIZE - phys_offset;
+        }
+        posix_fadvise(advise_fd_, static_cast<off_t>(phys_offset),
+                      static_cast<off_t>(phys_length), POSIX_FADV_WILLNEED);
     }
 #else
     (void)offset;
@@ -255,14 +359,14 @@ void TAEObjectReader::ParseMetadata(const uint8_t *buf, uint32_t len) {
 // ---------------------------------------------------------------------------
 
 void TAEObjectReader::ReadMeta() {
-    // Step 1: read 64-byte header
+    // Step 1: read 64-byte header (CRC-stripped if needed)
     auto hdr_buf = ReadBytes(0, HEADER_SIZE);
 
-    // Check magic (8 bytes, uint64 LE)
+    // Verify magic (already confirmed by DetectCrcFormat, but double-check)
     uint64_t magic;
     memcpy(&magic, hdr_buf.data(), 8);
     if (magic != OBJECT_MAGIC) {
-        throw std::runtime_error("invalid TAE magic: " +
+        throw std::runtime_error("invalid TAE magic after CRC strip: " +
                                  std::to_string(magic));
     }
 
@@ -373,6 +477,9 @@ DecodedColumn TAEObjectReader::DecodeVector(const uint8_t *buf, uint32_t len) {
         col.null_count = static_cast<uint64_t>(count);
 
         uint32_t words = static_cast<uint32_t>(data_size / 8);
+        if (24 + words * 8 > nsp_len) {
+            throw std::runtime_error("nsp data overflow");
+        }
         col.null_bitmap.resize(words);
         if (words > 0) {
             memcpy(col.null_bitmap.data(), p + 24, words * 8);
@@ -458,12 +565,10 @@ std::vector<DecodedColumn> TAEObjectReader::ReadBlock(
         req_to_coalesced[i] = static_cast<uint32_t>(coalesced.size());
         coalesced.push_back({reqs[i].offset, reqs[i].length, {}});
     }
-
     // Issue coalesced reads
     for (auto &cr : coalesced) {
         cr.data = ReadBytes(cr.offset, cr.length);
     }
-
     // Slice out individual columns and decode
     std::vector<DecodedColumn> result(seqnums.size());
 
@@ -476,6 +581,10 @@ std::vector<DecodedColumn> TAEObjectReader::ReadBlock(
         uint64_t local_off = req.offset - cr.offset;
         const uint8_t *raw = cr.data.data() + local_off;
         uint32_t raw_len = ext.length;
+
+        if (local_off + raw_len > cr.data.size()) {
+            throw std::runtime_error("column read overflow");
+        }
 
         // Decompress if needed
         std::vector<uint8_t> decompressed;
