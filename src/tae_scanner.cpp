@@ -269,9 +269,6 @@ TAEScanInit(duckdb::ClientContext &context,
     // Phase 3: Extract pushed-down filters.
     // entry.GetIndex() is a position in column_ids; we map it to
     // the decoded_cols position via col_ids_to_decoded.
-    // Phase 3: Extract pushed-down filters.
-    // entry.GetIndex() is a position in column_ids; we map it to
-    // the decoded_cols position via col_ids_to_decoded.
     if (input.filters) {
         for (auto &entry : input.filters->filters) {
             auto ci = static_cast<duckdb::idx_t>(entry.first);
@@ -555,6 +552,7 @@ static void TAEScanExecute(duckdb::ClientContext &context,
         }
     }
 
+next_block:
     // If we have pending rows from a previous block, emit the next chunk
     if (lstate && lstate->pending_offset < lstate->pending_total_rows) {
         goto emit_chunk;
@@ -701,12 +699,10 @@ emit_chunk:
             if (lstate->pending_offset < lstate->pending_total_rows) {
                 goto emit_chunk;
             }
-            // Block exhausted, loop back to grab next work unit
-            // Reset output and continue the main loop
-            output.SetCardinality(0);
-            // We can't easily loop back from here, so just return 0
-            // and let DuckDB call us again
-            return;
+            // Block exhausted — loop back to grab next work unit.
+            // Do NOT return cardinality 0 here: DuckDB would interpret
+            // that as "scan complete" and stop calling us.
+            goto next_block;
         }
 
         // Apply Bernoulli sampling if requested
