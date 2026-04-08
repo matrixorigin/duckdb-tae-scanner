@@ -1,168 +1,141 @@
 # DuckDB TAE Scanner Extension
 
-A DuckDB extension that reads [MatrixOne](https://github.com/matrixorigin/matrixone) TAE (Table Analytics Engine) object files directly, enabling external query engines to scan MO data without ETL.
+A [DuckDB](https://duckdb.org/) extension that reads [MatrixOne](https://github.com/matrixorigin/matrixone) TAE (Table Analytics Engine) object files directly, enabling external query engines to scan MO data without ETL.
+
+Built on DuckDB **v1.5.1** using the official extension build framework.
 
 ## Features
 
-- **Direct TAE binary format reading** — parses MO's columnar storage format (header, metadata, column data, zone maps)
-- **DuckDB FileSystem abstraction** — transparent support for local files and S3 (`s3://`) paths
-- **Projection pushdown** — reads only the columns needed by the query
-- **Zone map predicate pushdown** — evaluates pushed-down predicates against per-block zone maps to skip irrelevant blocks
-- **Object-level partition pruning** — skips entire objects when all blocks fail zone map filters at Init time
-- **Per-row filter evaluation** — applies pushed-down comparisons row-by-row after zone map block skip
-- **Filter-prune optimization** — filter-only columns excluded from output (DuckDB `filter_prune = true`)
-- **ORDER BY pushdown** — sorts work units by zone map statistics to produce approximately-ordered output
-- **LZ4 decompression** — handles MO's LZ4-compressed column data
-- **Full MO type support** — maps all MO types (bool, int8–uint64, float32/64, decimal64/128, date, datetime, timestamp, char, varchar, blob, text, uuid, enum) to DuckDB logical types
-- **CONSTANT vector support** — handles MO constant vectors (single value broadcast to all rows)
-- **Virtual columns** — exposes `file_path` and `block_id` as virtual columns for provenance tracking
-- **Sampling pushdown** — supports `TABLESAMPLE SYSTEM(N%)` via Bernoulli sampling in the scan
-- **Parallel block scanning** — multi-threaded execution with atomic work dispatch
-- **Planner statistics** — provides row-count estimates and column-level min/max from zone maps for optimizer pruning
-- **count(\*) metadata fast path** — resolves `SELECT count(*)` from manifest metadata with zero file I/O
-- **Targeted CRC reads** — reads only the needed bytes from CRC-wrapped files instead of stripping the entire file
-- **posix_fadvise prefetching** — `FADV_SEQUENTIAL` at open + `FADV_WILLNEED` look-ahead for next block
-- **EXPLAIN integration** — shows table name, object count, row count, blocks scanned/skipped in query plans
+| Category | Details |
+|----------|---------|
+| **Storage format** | Direct TAE binary parsing (header, metadata, column data, zone maps), LZ4 decompression, CRC32-wrapped file support (auto-detected) |
+| **I/O** | DuckDB FileSystem abstraction — local files and S3 (`s3://`) paths; `posix_fadvise` prefetching; targeted CRC reads (no full-file strip) |
+| **Pushdown** | Projection, zone map predicate, per-row filter, filter-prune (filter-only cols excluded from output), ORDER BY (sorts by zone map stats) |
+| **Pruning** | Block-level zone map skip, object-level partition prune (entire files skipped at Init time) |
+| **Types** | bool, int8–uint64, float32/64, decimal64/128, date, datetime, timestamp, char, varchar, blob, text, json, uuid, enum, bit; CONSTANT vectors |
+| **Parallelism** | Multi-threaded scan with atomic work-unit dispatch |
+| **Statistics** | Row-count estimates, column min/max from zone maps, `count(*)` metadata fast path (zero file I/O) |
+| **Extras** | Virtual columns (`file_path`, `block_id`), sampling pushdown (`TABLESAMPLE SYSTEM(N%)`), EXPLAIN integration |
 
 ## Quick Start
 
 ```sql
--- Load the extension
-LOAD 'tae_scanner.so';
+LOAD 'tae_scanner';
 
--- Scan a table via manifest file
+-- Scan a table via manifest
 SELECT * FROM tae_scan('/path/to/manifest.json');
 
--- With predicates (zone map + row-level pushdown)
+-- Predicates push down to zone maps + per-row filter
 SELECT * FROM tae_scan('/path/to/manifest.json')
 WHERE col_date >= DATE '1994-01-01' AND col_int > 100;
 
--- Virtual columns (file provenance)
+-- Virtual columns for provenance tracking
 SELECT file_path, block_id, col_int FROM tae_scan('/path/to/manifest.json');
 
 -- Sampling
 SELECT * FROM tae_scan('/path/to/manifest.json') TABLESAMPLE SYSTEM(10%);
+
+-- S3 (requires httpfs extension)
+SELECT count(*) FROM tae_scan('s3://bucket/manifests/lineitem.json');
 ```
 
-The manifest JSON file describes the schema, object list, and data directory. Generate it using `tae_manifest_gen.py` against a running MatrixOne instance.
+The manifest JSON describes the schema, object list, and data directory. Manifests are generated via MO's debug HTTP API (`/debug/tae/manifest`).
 
 ## Building
+
+This extension uses DuckDB's standard extension build system. DuckDB v1.5.1 is included as a Git submodule.
 
 ### Prerequisites
 
 | Dependency | Version | Notes |
 |-----------|---------|-------|
-| **C++ compiler** | C++17 | clang++ recommended, g++ also works |
+| **C++ compiler** | C++17 | clang++ recommended |
 | **CMake** | ≥ 3.14 | |
-| **DuckDB** | source tree | Must be built first (`make release`) |
-| **LZ4** | any | Development headers required |
+| **LZ4** | any | `sudo apt install liblz4-dev` (Ubuntu) |
 | **Python 3** | ≥ 3.6 | For test data generation only |
 
-### Install LZ4
+### Build
 
 ```bash
-# Ubuntu / Debian
-sudo apt install liblz4-dev
+git clone --recurse-submodules https://github.com/matrixorigin/duckdb-tae-scanner.git
+cd duckdb-tae-scanner
 
-# Fedora / RHEL
-sudo dnf install lz4-devel
-
-# macOS (Homebrew)
-brew install lz4
-```
-
-### Build DuckDB (if not already built)
-
-```bash
-git clone https://github.com/duckdb/duckdb.git
-cd duckdb
+# Using the DuckDB extension Makefile
 make release
-cd ..
 ```
 
-### Build the Extension
+The loadable extension is built at:
+```
+build/release/extension/tae_scanner/tae_scanner.duckdb_extension
+```
+
+### Alternative: Direct CMake
 
 ```bash
-cd duckdb_tae_scanner
-mkdir -p build && cd build
+# Initialize submodules if not done
+git submodule update --init --recursive
 
-cmake .. \
-  -DDUCKDB_DIR=/path/to/duckdb \
-  -DCMAKE_CXX_COMPILER=clang++ \
-  -DCMAKE_BUILD_TYPE=Release
-
-make -j$(nproc)
+# Build DuckDB + extension together
+cd duckdb
+GEN=ninja EXTENSION_CONFIGS="../extension_config.cmake" make release
 ```
-
-The shared library is built as `build/libtae_scanner.so` (or `.dylib` on macOS).
-
-#### CMake Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `DUCKDB_DIR` | *required* | Path to DuckDB source tree |
-| `CMAKE_BUILD_TYPE` | `Debug` | `Release` for optimized build |
-| `CMAKE_CXX_COMPILER` | system default | `clang++` recommended |
-| `BUILD_TESTS` | `ON` | Set `OFF` to skip test target |
 
 ### Running Tests
 
 ```bash
-# Generate test data (run from project root, not build/)
+# Generate test data first
 python3 test/gen_test_data.py
 
-# Build and run all tests
-cd build
-make -j$(nproc) tae_tests
-./test/tae_tests
+# Build and run
+make test
 ```
 
-#### Run tests by tag
+#### Test tags
 
 ```bash
-./test/tae_tests "[scan]"           # Basic scan tests
-./test/tae_tests "[filter]"         # Filter pushdown
-./test/tae_tests "[filter_prune]"   # Filter-prune optimization
-./test/tae_tests "[types]"          # Type mapping (decimal, uuid, blob)
-./test/tae_tests "[datetime]"       # Date/timestamp epoch conversion
-./test/tae_tests "[virtual]"        # Virtual columns
-./test/tae_tests "[sampling]"       # Sampling pushdown
-./test/tae_tests "[lz4]"            # LZ4 compression
-./test/tae_tests "[order]"          # ORDER BY pushdown
-./test/tae_tests "[partition_prune]" # Object-level pruning
-./test/tae_tests "[stats]"          # Planner statistics
-./test/tae_tests "[error]"          # Error handling
+./build/release/test/tae_tests "[scan]"            # Basic scan
+./build/release/test/tae_tests "[filter]"          # Filter pushdown
+./build/release/test/tae_tests "[filter_prune]"    # Filter-prune optimization
+./build/release/test/tae_tests "[types]"           # Type mapping
+./build/release/test/tae_tests "[datetime]"        # Date/timestamp
+./build/release/test/tae_tests "[lz4]"             # LZ4 compression
+./build/release/test/tae_tests "[orderby]"         # ORDER BY pushdown
+./build/release/test/tae_tests "[partition_prune]" # Object-level pruning
+./build/release/test/tae_tests "[stats]"           # Planner statistics
+./build/release/test/tae_tests "[reader]"          # Low-level reader
+./build/release/test/tae_tests "[zonemap]"         # Zone map evaluation
+./build/release/test/tae_tests "[error]"           # Error handling
 ```
 
-### Loading in DuckDB CLI
+### Loading in DuckDB
 
 ```bash
-# Start DuckDB
-./duckdb
+# Start DuckDB with unsigned extension loading
+./duckdb --unsigned
 
 # Load the extension
-LOAD '/path/to/duckdb_tae_scanner/build/libtae_scanner.so';
+LOAD '/path/to/tae_scanner.duckdb_extension';
 
-# Query MO data
-SELECT COUNT(*) FROM tae_scan('/path/to/manifest.json');
+# Query
+SELECT count(*) FROM tae_scan('/path/to/manifest.json');
 ```
 
-## Type Support
+## Type Mapping
 
-| MO Type | DuckDB Type | Fill Strategy |
-|---------|-------------|---------------|
-| bool, int8–int64, uint8–uint64, float32/64 | Native types | `memcpy` |
-| decimal64 | DECIMAL(w,s) | `memcpy` (8 bytes) |
-| decimal128 | DECIMAL(w,s) | `memcpy` (16 bytes) |
+| MO Type | DuckDB Type | Notes |
+|---------|-------------|-------|
+| bool, int8–int64, uint8–uint64, float32/64 | Native types | Direct `memcpy` |
+| decimal64 | DECIMAL(w,s) | 8-byte `memcpy` |
+| decimal128 | DECIMAL(w,s) | 16-byte `memcpy` |
 | date | DATE | Epoch offset adjustment |
 | datetime, timestamp | TIMESTAMP | Epoch offset adjustment |
 | char, varchar, text, json | VARCHAR | Varlena decode |
 | blob, binary, varbinary | BLOB | Varlena decode |
-| uuid | UUID | Big-endian → `hugeint_t` via `UUID::FromBlob` |
+| uuid | UUID | Big-endian → `hugeint_t` |
 | enum | USMALLINT | `memcpy` |
 | bit | UBIGINT | `memcpy` |
 
-All types support filter pushdown (zone map + per-row), null bitmaps, CONSTANT vectors, and planner statistics.
+All types support filter pushdown, null bitmaps, CONSTANT vectors, and planner statistics.
 
 ## Manifest Format
 
@@ -187,31 +160,45 @@ All types support filter pushdown (zone map + per-row), null bitmaps, CONSTANT v
 |-------|----------|-------------|
 | `columns[].name` | yes | Column name |
 | `columns[].oid` | yes | MO type OID (see `tae_types.hpp`) |
-| `columns[].width` | decimal only | Decimal precision |
-| `columns[].scale` | decimal only | Decimal scale |
+| `columns[].width` | decimal | Decimal precision |
+| `columns[].scale` | decimal | Decimal scale |
 | `objects[].path` | yes | Object file path (relative to `data_dir` or manifest dir) |
 | `objects[].rows` | yes | Total row count |
 | `objects[].blocks` | yes | Block count |
-| `data_dir` | no | Base directory for object paths (default: manifest's directory) |
+| `data_dir` | no | Base directory for object paths (default: manifest dir) |
 | `sort_column` | no | Column name for ORDER BY pushdown hint |
 
-Generate manifests from a running MatrixOne instance:
+## Project Structure
 
-```bash
-python3 tae_manifest_gen.py --db tpch --table lineitem --output manifest.json
 ```
-
-## Architecture
-
-See [DESIGN.md](DESIGN.md) for the full architecture document covering:
-- TAE binary format specification (header, metadata, column layout, zone maps)
-- 3-phase Init design (read_seqnums → output_map → filter extraction)
-- Zone map evaluation and filter pipeline
-- Object-level partition pruning
-- ORDER BY pushdown with zone map sort keys
-- S3 support and read coalescing
-- posix_fadvise prefetching
-- MO → Sirius-DB integration architecture
+├── CMakeLists.txt              # Extension build rules (LZ4, C++17)
+├── Makefile                    # DuckDB extension build driver
+├── extension_config.cmake      # Extension registration
+├── duckdb/                     # DuckDB v1.5.1 (submodule)
+├── extension-ci-tools/         # DuckDB CI tooling (submodule)
+├── include/
+│   ├── tae_scanner.hpp         # tae_scan() table function
+│   ├── tae_object_reader.hpp   # TAE binary format reader
+│   ├── tae_column_fill.hpp     # Column data → DuckDB vector fill
+│   ├── tae_filter.hpp          # Per-row filter evaluation
+│   ├── tae_types.hpp           # MO type OID → DuckDB type mapping
+│   ├── tae_zonemap.hpp         # Zone map predicate evaluation
+│   └── tae_scanner_extension.hpp
+├── src/
+│   ├── tae_scanner.cpp         # Table function (bind, init, scan, statistics)
+│   ├── tae_object_reader.cpp   # Binary format parser, CRC handling
+│   ├── tae_column_fill.cpp     # Type-specific column filling
+│   ├── tae_filter.cpp          # Row-level filter engine
+│   └── tae_scanner_extension.cpp  # Extension entry point
+└── test/
+    ├── gen_test_data.py        # Test data generator
+    ├── test_scan_basic.cpp     # Scan, projection, parallel, explain
+    ├── test_scan_filters.cpp   # LZ4, ORDER BY, filter-prune, stats, partition prune
+    ├── test_scan_types.cpp     # Decimal, UUID, blob, date, timestamp
+    ├── test_scan_errors.cpp    # Error handling
+    ├── test_reader.cpp         # Low-level reader, coalescing, prefetch
+    └── test_zonemap.cpp        # Zone map evaluation
+```
 
 ## License
 
