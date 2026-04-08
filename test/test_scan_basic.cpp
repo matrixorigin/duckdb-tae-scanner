@@ -1,0 +1,486 @@
+// Copyright 2026 Matrix Origin
+// SPDX-License-Identifier: Apache-2.0
+//
+// Basic scan, projection, multi-block, multi-file, nulls, COUNT, stats,
+// EXPLAIN, parallel, virtual columns, sampling, constants.
+
+#include "test_helpers.hpp"
+
+// ===================================================================
+// Basic scan
+// ===================================================================
+
+TEST_CASE("Scan: basic_3col returns all rows", "[scan]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT * FROM tae_scan('" + ManifestPath("manifest.json") + "')");
+    REQUIRE(result->HasError() == false);
+    REQUIRE(result->RowCount() == 8);
+    REQUIRE(result->ColumnCount() == 3);
+
+    // Check column names
+    REQUIRE(result->names[0] == "col_int");
+    REQUIRE(result->names[1] == "col_str");
+    REQUIRE(result->names[2] == "col_dbl");
+}
+
+TEST_CASE("Scan: basic_3col data values", "[scan]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT col_int, col_str, col_dbl FROM tae_scan('" +
+                              ManifestPath("manifest.json") + "') ORDER BY col_int");
+    REQUIRE_FALSE(result->HasError());
+
+    // Row 0: col_int=10, col_str='alpha', col_dbl≈1.1
+    REQUIRE(result->GetValue(0, 0) == Value::INTEGER(10));
+    REQUIRE(result->GetValue(1, 0) == Value("alpha"));
+    REQUIRE(result->GetValue(2, 0).GetValue<double>() == Approx(1.1));
+
+    // Row 7: col_int=80, col_str='theta', col_dbl≈8.8
+    REQUIRE(result->GetValue(0, 7) == Value::INTEGER(80));
+    REQUIRE(result->GetValue(1, 7) == Value("theta"));
+    REQUIRE(result->GetValue(2, 7).GetValue<double>() == Approx(8.8));
+}
+
+// ===================================================================
+// Projection pushdown
+// ===================================================================
+
+TEST_CASE("Scan: projection pushdown reads only requested columns", "[scan]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT col_str FROM tae_scan('" +
+                              ManifestPath("manifest.json") + "')");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->ColumnCount() == 1);
+    REQUIRE(result->RowCount() == 8);
+    REQUIRE(result->GetValue(0, 0) == Value("alpha"));
+}
+
+// ===================================================================
+// Multi-block
+// ===================================================================
+
+TEST_CASE("Scan: multi_block reads across blocks", "[scan]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT col_int FROM tae_scan('" +
+                              ManifestPath("manifest_multi.json") + "') ORDER BY col_int");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 8);
+    // First block: 1,2,3,4; Second block: 100,200,300,400
+    REQUIRE(result->GetValue(0, 0) == Value::INTEGER(1));
+    REQUIRE(result->GetValue(0, 7) == Value::INTEGER(400));
+}
+
+// ===================================================================
+// Multi-file (multiple .tae objects in one manifest)
+// ===================================================================
+
+TEST_CASE("Scan: multi-file reads across TAE objects", "[scan][multifile]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT col_int, col_str, col_dbl FROM tae_scan('" +
+                              ManifestPath("manifest_multifile.json") + "') ORDER BY col_int");
+    REQUIRE_FALSE(result->HasError());
+    // 8 rows from basic_3col.tae + 4 rows from basic_3col_part2.tae = 12
+    REQUIRE(result->RowCount() == 12);
+    REQUIRE(result->ColumnCount() == 3);
+
+    // First file rows (sorted): 10..80
+    REQUIRE(result->GetValue(0, 0) == Value::INTEGER(10));
+    REQUIRE(result->GetValue(1, 0) == Value("alpha"));
+
+    // Last rows (from second file): 100..400
+    REQUIRE(result->GetValue(0, 8) == Value::INTEGER(100));
+    REQUIRE(result->GetValue(1, 8) == Value("one"));
+    REQUIRE(result->GetValue(0, 11) == Value::INTEGER(400));
+    REQUIRE(result->GetValue(1, 11) == Value("four"));
+}
+
+TEST_CASE("Scan: multi-file COUNT(*)", "[scan][multifile]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT COUNT(*) FROM tae_scan('" +
+                              ManifestPath("manifest_multifile.json") + "')");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->GetValue(0, 0) == Value::BIGINT(12));
+}
+
+TEST_CASE("Scan: multi-file filter crosses file boundary", "[scan][multifile]") {
+    auto db = MakeDB();
+    // Filter that spans both files: col_int > 50
+    // File 1: 60,70,80 match. File 2: 100,200,300,400 match. Total 7 rows.
+    auto result = Query(*db, "SELECT col_int FROM tae_scan('" +
+                              ManifestPath("manifest_multifile.json") +
+                              "') WHERE col_int > 50 ORDER BY col_int");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 7);
+    REQUIRE(result->GetValue(0, 0) == Value::INTEGER(60));
+    REQUIRE(result->GetValue(0, 6) == Value::INTEGER(400));
+}
+
+// ===================================================================
+// Null handling
+// ===================================================================
+
+TEST_CASE("Scan: with_nulls shows correct NULL values", "[scan]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT col_int, col_str FROM tae_scan('" +
+                              ManifestPath("manifest_nulls.json") + "')");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 6);
+
+    // Row 0: 10, 'hello'
+    REQUIRE(result->GetValue(0, 0) == Value::INTEGER(10));
+    REQUIRE(result->GetValue(1, 0) == Value("hello"));
+
+    // Row 1: NULL, 'world'
+    REQUIRE(result->GetValue(0, 1).IsNull());
+    REQUIRE(result->GetValue(1, 1) == Value("world"));
+
+    // Row 2: 30, NULL
+    REQUIRE(result->GetValue(0, 2) == Value::INTEGER(30));
+    REQUIRE(result->GetValue(1, 2).IsNull());
+
+    // Row 3: NULL, 'test'
+    REQUIRE(result->GetValue(0, 3).IsNull());
+    REQUIRE(result->GetValue(1, 3) == Value("test"));
+}
+
+// ===================================================================
+// Filter pushdown (zone map)
+// ===================================================================
+
+TEST_CASE("Scan: zone map filter skips blocks", "[scan]") {
+    auto db = MakeDB();
+    // Block 0 has values 1..4, block 1 has 100..400
+    // WHERE col_int > 50 should skip block 0
+    auto result = Query(*db, "SELECT col_int FROM tae_scan('" +
+                              ManifestPath("manifest_multi.json") +
+                              "') WHERE col_int > 50 ORDER BY col_int");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 4);
+    REQUIRE(result->GetValue(0, 0) == Value::INTEGER(100));
+    REQUIRE(result->GetValue(0, 3) == Value::INTEGER(400));
+}
+
+TEST_CASE("Scan: WHERE filters with no matching blocks", "[scan]") {
+    auto db = MakeDB();
+    // No values > 1000 exist
+    auto result = Query(*db, "SELECT col_int FROM tae_scan('" +
+                              ManifestPath("manifest_multi.json") +
+                              "') WHERE col_int > 1000");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 0);
+}
+
+// ===================================================================
+// COUNT(*) with scan
+// ===================================================================
+
+TEST_CASE("Scan: COUNT(*) works", "[scan]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT COUNT(*) FROM tae_scan('" +
+                              ManifestPath("manifest.json") + "')");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->GetValue(0, 0) == Value::BIGINT(8));
+}
+
+// ===================================================================
+// Planner statistics
+// ===================================================================
+
+TEST_CASE("Scan: cardinality estimate appears in EXPLAIN", "[scan][stats]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "EXPLAIN SELECT * FROM tae_scan('" +
+                              ManifestPath("manifest.json") + "')");
+    REQUIRE_FALSE(result->HasError());
+    auto explain_str = result->GetValue(1, 0).ToString();
+    // DuckDB uppercases the function name in EXPLAIN output
+    REQUIRE(explain_str.find("TAE_SCAN") != std::string::npos);
+}
+
+TEST_CASE("Scan: cardinality single file = 8 rows", "[scan][stats]") {
+    auto db = MakeDB();
+    // Verify cardinality by checking that COUNT(*) returns the manifest row count
+    auto result = Query(*db, "SELECT COUNT(*) FROM tae_scan('" +
+                              ManifestPath("manifest.json") + "')");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->GetValue(0, 0) == Value::BIGINT(8));
+}
+
+TEST_CASE("Scan: cardinality multi-file = 12 rows", "[scan][stats]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT COUNT(*) FROM tae_scan('" +
+                              ManifestPath("manifest_multifile.json") + "')");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->GetValue(0, 0) == Value::BIGINT(12));
+}
+
+TEST_CASE("Scan: column stats enable optimized filter elimination", "[scan][stats]") {
+    auto db = MakeDB();
+    // basic_3col has col_int in [10..80]. A filter col_int > 1000 should return 0 rows.
+    // The planner may use column stats to realize this is impossible.
+    auto result = Query(*db, "SELECT COUNT(*) FROM tae_scan('" +
+                              ManifestPath("manifest.json") +
+                              "') WHERE col_int > 1000");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->GetValue(0, 0) == Value::BIGINT(0));
+}
+
+TEST_CASE("Scan: column stats min/max respected in range queries", "[scan][stats]") {
+    auto db = MakeDB();
+    // All col_int values in basic_3col are 10,20,...,80
+    // col_int >= 10 AND col_int <= 80 should return all 8 rows
+    auto result = Query(*db, "SELECT COUNT(*) FROM tae_scan('" +
+                              ManifestPath("manifest.json") +
+                              "') WHERE col_int >= 10 AND col_int <= 80");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->GetValue(0, 0) == Value::BIGINT(8));
+}
+
+// ===================================================================
+// EXPLAIN output (to_string / dynamic_to_string)
+// ===================================================================
+
+TEST_CASE("Scan: EXPLAIN shows table name and object count", "[scan][explain]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "EXPLAIN SELECT * FROM tae_scan('" +
+                              ManifestPath("manifest_multifile.json") + "')");
+    REQUIRE_FALSE(result->HasError());
+    auto text = result->GetValue(1, 0).ToString();
+    REQUIRE(text.find("test_multifile") != std::string::npos);
+    REQUIRE(text.find("Objects: 2") != std::string::npos);
+    REQUIRE(text.find("Total Rows: 12") != std::string::npos);
+}
+
+TEST_CASE("Scan: EXPLAIN ANALYZE shows runtime stats", "[scan][explain]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "EXPLAIN ANALYZE SELECT * FROM tae_scan('" +
+                              ManifestPath("manifest.json") + "')");
+    REQUIRE_FALSE(result->HasError());
+    auto text = result->GetValue(1, 0).ToString();
+    REQUIRE(text.find("Blocks Scanned") != std::string::npos);
+    REQUIRE(text.find("Rows Emitted") != std::string::npos);
+}
+
+// ===================================================================
+// Parallel scanning correctness
+// ===================================================================
+
+TEST_CASE("Scan: parallel scan returns correct results for multi-block", "[scan][parallel]") {
+    auto db = MakeDB();
+    // multi_block has 2 blocks: block0=[1,2,3,4], block1=[100,200,300,400]
+    // With parallelism, blocks may be scanned in any order; ORDER BY ensures determinism
+    auto result = Query(*db, "SELECT col_int FROM tae_scan('" +
+                              ManifestPath("manifest_multi.json") +
+                              "') ORDER BY col_int");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 8);
+    REQUIRE(result->GetValue(0, 0) == Value::INTEGER(1));
+    REQUIRE(result->GetValue(0, 3) == Value::INTEGER(4));
+    REQUIRE(result->GetValue(0, 4) == Value::INTEGER(100));
+    REQUIRE(result->GetValue(0, 7) == Value::INTEGER(400));
+}
+
+TEST_CASE("Scan: parallel scan correctness with multi-file", "[scan][parallel]") {
+    auto db = MakeDB();
+    // 2 objects (8+4 rows), blocks may be scanned in parallel
+    auto result = Query(*db, "SELECT col_int FROM tae_scan('" +
+                              ManifestPath("manifest_multifile.json") +
+                              "') ORDER BY col_int");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 12);
+    REQUIRE(result->GetValue(0, 0) == Value::INTEGER(10));
+    REQUIRE(result->GetValue(0, 11) == Value::INTEGER(400));
+}
+
+TEST_CASE("Scan: parallel scan with filter returns correct subset", "[scan][parallel]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT col_int FROM tae_scan('" +
+                              ManifestPath("manifest_multifile.json") +
+                              "') WHERE col_int >= 100 ORDER BY col_int");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 4);
+    REQUIRE(result->GetValue(0, 0) == Value::INTEGER(100));
+    REQUIRE(result->GetValue(0, 3) == Value::INTEGER(400));
+}
+
+// ===================================================================
+// Virtual columns
+// ===================================================================
+
+TEST_CASE("Scan: virtual column file_path returns object filename", "[scan][virtual]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT file_path FROM tae_scan('" +
+                              ManifestPath("manifest.json") + "')");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 8);
+    // All rows should have the same file path
+    auto val = result->GetValue(0, 0).ToString();
+    CHECK(val.find("basic_3col.tae") != std::string::npos);
+    for (idx_t i = 1; i < result->RowCount(); i++) {
+        CHECK(result->GetValue(0, i).ToString() == val);
+    }
+}
+
+TEST_CASE("Scan: virtual column block_id returns block index", "[scan][virtual]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT block_id FROM tae_scan('" +
+                              ManifestPath("manifest_multi.json") + "') ORDER BY block_id");
+    REQUIRE_FALSE(result->HasError());
+    // multi_block.tae has 2 blocks, 4 rows each
+    REQUIRE(result->RowCount() == 8);
+    // First 4 rows should be block 0, next 4 block 1
+    for (idx_t i = 0; i < 4; i++) {
+        CHECK(result->GetValue(0, i) == Value::INTEGER(0));
+    }
+    for (idx_t i = 4; i < 8; i++) {
+        CHECK(result->GetValue(0, i) == Value::INTEGER(1));
+    }
+}
+
+TEST_CASE("Scan: virtual columns mixed with TAE columns", "[scan][virtual]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT col_int, file_path, block_id FROM tae_scan('" +
+                              ManifestPath("manifest.json") + "') ORDER BY col_int");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 8);
+    // Check TAE column values
+    CHECK(result->GetValue(0, 0) == Value::INTEGER(10));
+    CHECK(result->GetValue(0, 7) == Value::INTEGER(80));
+    // file_path for all rows
+    auto fname = result->GetValue(1, 0).ToString();
+    CHECK(fname.find("basic_3col.tae") != std::string::npos);
+    // block_id should be 0 for single-block file
+    for (idx_t i = 0; i < 8; i++) {
+        CHECK(result->GetValue(2, i) == Value::INTEGER(0));
+    }
+}
+
+TEST_CASE("Scan: virtual columns with multi-file show different file paths", "[scan][virtual]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT col_int, file_path FROM tae_scan('" +
+                              ManifestPath("manifest_multifile.json") +
+                              "') ORDER BY col_int");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 12);
+    // Rows from basic_3col.tae (int 10-80) and basic_3col_part2.tae (int 100-400)
+    auto fp_first = result->GetValue(1, 0).ToString();   // int=10 → basic_3col.tae
+    auto fp_last  = result->GetValue(1, 11).ToString();   // int=400 → basic_3col_part2.tae
+    CHECK(fp_first.find("basic_3col.tae") != std::string::npos);
+    CHECK(fp_last.find("basic_3col_part2.tae") != std::string::npos);
+    CHECK(fp_first != fp_last);
+}
+
+// ===================================================================
+// Sampling pushdown
+// ===================================================================
+
+TEST_CASE("Scan: TABLESAMPLE SYSTEM returns subset of rows", "[scan][sample]") {
+    auto db = MakeDB();
+    // 50% system sample of 8 rows — should return fewer than 8 most of the time.
+    // Run multiple times to avoid flaky failures from randomness.
+    bool saw_fewer = false;
+    for (int trial = 0; trial < 10; trial++) {
+        auto result = Query(*db, "SELECT col_int FROM tae_scan('" +
+                                  ManifestPath("manifest.json") +
+                                  "') TABLESAMPLE SYSTEM(50%)");
+        if (result->HasError()) { UNSCOPED_INFO("Error: " << result->GetError()); }
+        REQUIRE_FALSE(result->HasError());
+        CHECK(result->RowCount() <= 8);
+        if (result->RowCount() < 8) saw_fewer = true;
+    }
+    CHECK(saw_fewer);
+}
+
+TEST_CASE("Scan: TABLESAMPLE SYSTEM 100% returns all rows", "[scan][sample]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT col_int FROM tae_scan('" +
+                              ManifestPath("manifest.json") +
+                              "') TABLESAMPLE SYSTEM(100%)");
+    if (result->HasError()) { UNSCOPED_INFO("Error: " << result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 8);
+}
+
+TEST_CASE("Scan: TABLESAMPLE SYSTEM 0% returns no rows", "[scan][sample]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT col_int FROM tae_scan('" +
+                              ManifestPath("manifest.json") +
+                              "') TABLESAMPLE SYSTEM(0%)");
+    if (result->HasError()) { UNSCOPED_INFO("Error: " << result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+    // 0% should return 0 rows (rate=0, all rows rejected)
+    REQUIRE(result->RowCount() == 0);
+}
+
+// ===================================================================
+// Constant vector handling
+// ===================================================================
+
+TEST_CASE("Scan: constant int column returns same value for all rows", "[scan][constant]") {
+    auto db = MakeDB();
+    // Block 0 has col_int = CONSTANT(42), 4 rows
+    // Block 1 has col_int = FLAT [10,20,30,40], 4 rows
+    auto result = Query(*db, "SELECT col_int FROM tae_scan('" +
+                              ManifestPath("manifest_constants.json") +
+                              "') ORDER BY col_int");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 8);
+    // Sorted: 10, 20, 30, 40, 42, 42, 42, 42
+    CHECK(result->GetValue(0, 0) == Value::INTEGER(10));
+    CHECK(result->GetValue(0, 1) == Value::INTEGER(20));
+    CHECK(result->GetValue(0, 2) == Value::INTEGER(30));
+    CHECK(result->GetValue(0, 3) == Value::INTEGER(40));
+    CHECK(result->GetValue(0, 4) == Value::INTEGER(42));
+    CHECK(result->GetValue(0, 5) == Value::INTEGER(42));
+    CHECK(result->GetValue(0, 6) == Value::INTEGER(42));
+    CHECK(result->GetValue(0, 7) == Value::INTEGER(42));
+}
+
+TEST_CASE("Scan: constant string column returns same value for all rows", "[scan][constant]") {
+    auto db = MakeDB();
+    // Block 1 has col_str = CONSTANT('hello'), 4 rows
+    auto result = Query(*db, "SELECT col_str FROM tae_scan('" +
+                              ManifestPath("manifest_constants.json") +
+                              "') ORDER BY col_str");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 8);
+    // Block 0 has flat strings a,b,c,d; block 1 has constant 'hello'
+    // Sorted: a, b, c, d, hello, hello, hello, hello
+    CHECK(result->GetValue(0, 0) == Value("a"));
+    CHECK(result->GetValue(0, 3) == Value("d"));
+    CHECK(result->GetValue(0, 4) == Value("hello"));
+    CHECK(result->GetValue(0, 7) == Value("hello"));
+}
+
+TEST_CASE("Scan: constant NULL double column returns NULLs", "[scan][constant]") {
+    auto db = MakeDB();
+    // Block 0 has col_dbl = CONSTANT(3.14); block 1 has CONSTANT_NULL
+    auto result = Query(*db, "SELECT col_dbl FROM tae_scan('" +
+                              ManifestPath("manifest_constants.json") + "')");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 8);
+    // Count non-null and null values
+    int null_count = 0;
+    int nonnull_count = 0;
+    for (idx_t i = 0; i < 8; i++) {
+        if (result->GetValue(0, i).IsNull()) {
+            null_count++;
+        } else {
+            nonnull_count++;
+            CHECK(result->GetValue(0, i).GetValue<double>() == Approx(3.14));
+        }
+    }
+    CHECK(null_count == 4);      // block 1: 4 constant NULLs
+    CHECK(nonnull_count == 4);   // block 0: 4 constant 3.14
+}
+
+TEST_CASE("Scan: mixed constant/flat columns work together", "[scan][constant]") {
+    auto db = MakeDB();
+    auto result = Query(*db, "SELECT col_int, col_str, col_dbl FROM tae_scan('" +
+                              ManifestPath("manifest_constants.json") +
+                              "') ORDER BY col_int, col_str");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 8);
+    // Row with col_int=10 comes from block 1 (int=FLAT, str=CONST 'hello', dbl=CONST_NULL)
+    CHECK(result->GetValue(0, 0) == Value::INTEGER(10));
+    CHECK(result->GetValue(1, 0) == Value("hello"));
+    CHECK(result->GetValue(2, 0).IsNull());
+}

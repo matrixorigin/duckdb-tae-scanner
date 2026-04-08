@@ -9,7 +9,10 @@ add_executable(tae_tests
     test_types.cpp
     test_zonemap.cpp
     test_reader.cpp
-    test_scan.cpp
+    test_scan_basic.cpp
+    test_scan_types.cpp
+    test_scan_filters.cpp
+    test_scan_errors.cpp
 )
 
 target_include_directories(tae_tests PRIVATE

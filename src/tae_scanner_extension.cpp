@@ -6,28 +6,28 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "tae_scanner.hpp"
+#include "tae_scanner_extension.hpp"
 #include "duckdb.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
-namespace tae {
+// Static extension class used when linked into DuckDB.
+namespace duckdb {
 
-class TAEScannerExtension : public duckdb::Extension {
-public:
-    void Load(duckdb::ExtensionLoader &loader) override {
-        loader.RegisterFunction(GetTAEScanFunction());
-    }
+void TaeScannerExtension::Load(ExtensionLoader &loader) {
+    loader.RegisterFunction(tae::GetTAEScanFunction());
+}
 
-    std::string Name() override {
-        return "tae_scanner";
-    }
+std::string TaeScannerExtension::Name() {
+    return "tae_scanner";
+}
 
-    std::string Version() const override {
-        return "0.1.0";
-    }
-};
+std::string TaeScannerExtension::Version() const {
+    return "0.1.0";
+}
 
-} // namespace tae
+} // namespace duckdb
 
+// Dynamic extension entry point (LOAD 'tae_scanner.duckdb_extension').
 extern "C" {
 
 DUCKDB_CPP_EXTENSION_ENTRY(tae_scanner, loader) {
