@@ -45,6 +45,14 @@ set_target_properties(${LOADABLE_EXTENSION_NAME} PROPERTIES CXX_STANDARD 17)
 target_link_libraries(${EXTENSION_NAME} ${LZ4_LIBRARIES} stdc++fs)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} ${LZ4_LIBRARIES} stdc++fs)
 
+# DuckDB v1.5.x unity builds emit strong symbols for static constexpr members
+# that conflict with inline definitions from headers included in extension code.
+# INTERFACE on static lib propagates to consumers (e.g. duckdb shell).
+target_link_options(${EXTENSION_NAME} INTERFACE
+                    "LINKER:--allow-multiple-definition")
+target_link_options(${LOADABLE_EXTENSION_NAME} PRIVATE
+                    "LINKER:--allow-multiple-definition")
+
 if(LZ4_INCLUDE_DIRS)
     target_include_directories(${EXTENSION_NAME} PRIVATE ${LZ4_INCLUDE_DIRS})
     target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE ${LZ4_INCLUDE_DIRS})
