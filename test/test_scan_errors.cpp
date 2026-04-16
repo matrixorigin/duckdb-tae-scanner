@@ -36,7 +36,8 @@ TEST_CASE("Error: missing manifest file", "[error]") {
     auto db = MakeDB();
     auto result = Query(*db, "SELECT * FROM tae_scan('/tmp/nonexistent_manifest_xyz.json')");
     REQUIRE(result->HasError());
-    CHECK(result->GetError().find("cannot open manifest") != std::string::npos);
+    // DuckDB FileSystem throws "Cannot open file ... No such file or directory"
+    CHECK(result->GetError().find("Cannot open file") != std::string::npos);
 }
 
 TEST_CASE("Error: malformed JSON manifest", "[error]") {
@@ -86,7 +87,7 @@ TEST_CASE("Error: object file does not exist", "[error]") {
 TEST_CASE("Error: empty manifest returns no rows", "[error]") {
     // Valid JSON but no objects/columns
     auto path = WriteTempFile("empty_manifest.json",
-        std::vector<uint8_t>('{', '}'));
+        std::vector<uint8_t>({'{', '}'}));
     auto db = MakeDB();
     auto result = Query(*db, "SELECT * FROM tae_scan('" + path + "')");
     // Should succeed with 0 columns → DuckDB may report error or empty

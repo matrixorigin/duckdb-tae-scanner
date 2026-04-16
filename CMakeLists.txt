@@ -64,3 +64,9 @@ install(
     LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
     ARCHIVE DESTINATION "${INSTALL_LIB_DIR}"
 )
+
+# Build Catch2 unit tests when the DuckDB build enables testing
+if(BUILD_UNITTESTS)
+    set(TAE_SCANNER_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+    add_subdirectory(test)
+endif()

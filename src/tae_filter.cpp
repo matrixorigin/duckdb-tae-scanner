@@ -82,6 +82,11 @@ static bool EncodeConstant(const duckdb::Value &val, uint8_t mo_oid,
         memcpy(out_bytes.data(), &v, 8);
         break;
     }
+    case MO_T_time: {
+        auto v = val.GetValue<int64_t>();
+        memcpy(out_bytes.data(), &v, 8);
+        break;
+    }
     case MO_T_decimal64: {
         int64_t v;
         switch (val.type().InternalType()) {
@@ -193,7 +198,8 @@ static bool EvalFilterOnZoneMap(const PushedFilter &pf,
     case MO_T_date:    { int32_t v;  memcpy(&v, pf.constant.data(), 4); return ZoneMapCheckFixed(zm, pf.op, v); }
     case MO_T_int64:
     case MO_T_datetime:
-    case MO_T_timestamp: { int64_t v; memcpy(&v, pf.constant.data(), 8); return ZoneMapCheckFixed(zm, pf.op, v); }
+    case MO_T_timestamp:
+    case MO_T_time: { int64_t v; memcpy(&v, pf.constant.data(), 8); return ZoneMapCheckFixed(zm, pf.op, v); }
     case MO_T_uint8:   { uint8_t v;  memcpy(&v, pf.constant.data(), 1); return ZoneMapCheckFixed(zm, pf.op, v); }
     case MO_T_uint16:  { uint16_t v; memcpy(&v, pf.constant.data(), 2); return ZoneMapCheckFixed(zm, pf.op, v); }
     case MO_T_uint32:  { uint32_t v; memcpy(&v, pf.constant.data(), 4); return ZoneMapCheckFixed(zm, pf.op, v); }
@@ -317,7 +323,8 @@ static bool RowPassesFilter(const PushedFilter &pf, const DecodedColumn &col,
     case MO_T_date:      return CompareFixed<int32_t>(pf.op, row_ptr, const_ptr);
     case MO_T_int64:
     case MO_T_datetime:
-    case MO_T_timestamp: return CompareFixed<int64_t>(pf.op, row_ptr, const_ptr);
+    case MO_T_timestamp:
+    case MO_T_time:      return CompareFixed<int64_t>(pf.op, row_ptr, const_ptr);
     case MO_T_uint8:     return CompareFixed<uint8_t>(pf.op, row_ptr, const_ptr);
     case MO_T_uint16:    return CompareFixed<uint16_t>(pf.op, row_ptr, const_ptr);
     case MO_T_uint32:    return CompareFixed<uint32_t>(pf.op, row_ptr, const_ptr);
@@ -403,6 +410,10 @@ duckdb::Value ZoneMapBytesToValue(const uint8_t *ptr, MOTypeOid oid,
     case MO_T_timestamp: {
         int64_t v; memcpy(&v, ptr, sizeof(v));
         return duckdb::Value::TIMESTAMP(duckdb::Timestamp::FromEpochMicroSeconds(v - MO_UNIX_EPOCH_USEC));
+    }
+    case MO_T_time: {
+        int64_t v; memcpy(&v, ptr, sizeof(v));
+        return duckdb::Value::TIME(duckdb::dtime_t(v));
     }
     case MO_T_decimal64: {
         int64_t v; memcpy(&v, ptr, sizeof(v));

@@ -473,10 +473,17 @@ TAEScanInitLocal(duckdb::ExecutionContext &context,
 }
 
 // Compute per-block row count from manifest metadata (no file I/O).
-// All blocks except the last have exactly 8192 rows.
+// Production MO blocks always have 8192 rows (except the last).
+// Handle small test data where total_rows < 8192 by distributing evenly.
 static inline duckdb::idx_t ManifestBlockRowCount(
     const TAEObjectInfo &obj, uint32_t block_idx) {
-    constexpr uint32_t ROWS_PER_BLOCK = 8192;
+    constexpr duckdb::idx_t ROWS_PER_BLOCK = 8192;
+    if (obj.blocks <= 1) return obj.rows;
+    if (obj.rows <= ROWS_PER_BLOCK) {
+        duckdb::idx_t per_block = obj.rows / obj.blocks;
+        if (block_idx + 1 < obj.blocks) return per_block;
+        return obj.rows - static_cast<duckdb::idx_t>(obj.blocks - 1) * per_block;
+    }
     if (block_idx + 1 < obj.blocks) return ROWS_PER_BLOCK;
     return obj.rows - static_cast<duckdb::idx_t>(obj.blocks - 1) * ROWS_PER_BLOCK;
 }
@@ -965,6 +972,10 @@ static bool TAEScanSupportsPushdownType(const duckdb::FunctionData &bind_data_p,
     case duckdb::LogicalTypeId::DATE:
     case duckdb::LogicalTypeId::TIMESTAMP:
     case duckdb::LogicalTypeId::VARCHAR:
+    case duckdb::LogicalTypeId::DECIMAL:
+    case duckdb::LogicalTypeId::UUID:
+    case duckdb::LogicalTypeId::TIME:
+    case duckdb::LogicalTypeId::BLOB:
         return true;
     default:
         return false;

@@ -95,6 +95,22 @@ struct TAEScanBindData : public duckdb::TableFunctionData {
 
     // ORDER BY pushdown from DuckDB optimizer (set before Init)
     std::unique_ptr<ScanOrderInfo> scan_order;
+
+    duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
+        auto copy = duckdb::make_uniq<TAEScanBindData>();
+        copy->data_dir        = data_dir;
+        copy->db_name         = db_name;
+        copy->table_name      = table_name;
+        copy->all_col_names   = all_col_names;
+        copy->all_col_types   = all_col_types;
+        copy->all_col_mo_oids = all_col_mo_oids;
+        copy->objects         = objects;
+        copy->total_rows      = total_rows;
+        copy->total_blocks    = total_blocks;
+        copy->sort_column_idx = sort_column_idx;
+        // scan_order is runtime state; not copied
+        return copy;
+    }
 };
 
 // ---------------------------------------------------------------------------

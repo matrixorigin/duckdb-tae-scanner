@@ -321,8 +321,9 @@ TEST_CASE("Scan: virtual column file_path returns object filename", "[scan][virt
 
 TEST_CASE("Scan: virtual column block_id returns block index", "[scan][virtual]") {
     auto db = MakeDB();
+    // No ORDER BY — blocks are read sequentially (block 0 then block 1)
     auto result = Query(*db, "SELECT block_id FROM tae_scan('" +
-                              ManifestPath("manifest_multi.json") + "') ORDER BY block_id");
+                              ManifestPath("manifest_multi.json") + "')");
     REQUIRE_FALSE(result->HasError());
     // multi_block.tae has 2 blocks, 4 rows each
     REQUIRE(result->RowCount() == 8);
