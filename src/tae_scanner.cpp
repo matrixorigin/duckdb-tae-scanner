@@ -30,7 +30,6 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/file_open_flags.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "duckdb/main/extension_helper.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -202,11 +201,6 @@ TAEScanBind(duckdb::ClientContext &context,
 
     auto bind_data = duckdb::make_uniq<TAEScanBindData>();
     auto manifest_path = input.inputs[0].GetValue<std::string>();
-
-    // Ensure httpfs is loaded for HTTP manifest URLs
-    if (manifest_path.rfind("http://", 0) == 0 || manifest_path.rfind("https://", 0) == 0) {
-        duckdb::ExtensionHelper::AutoLoadExtension(context, "httpfs");
-    }
 
     // Parse the manifest JSON (supports local files and HTTP URLs)
     ParseManifest(context, manifest_path, *bind_data);
