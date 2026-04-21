@@ -51,6 +51,9 @@ struct PushedFilter {
     // Constant value stored as raw bytes (same encoding as zone map)
     std::vector<uint8_t> constant;
     uint32_t    const_len;     // for string types: actual string length
+    // For IN_SET: each element is an encoded value (same format as `constant`).
+    std::vector<std::vector<uint8_t>> in_values;
+    std::vector<uint32_t>             in_value_lens;
 };
 
 // ---------------------------------------------------------------------------

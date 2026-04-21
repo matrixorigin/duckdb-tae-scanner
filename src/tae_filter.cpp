@@ -11,6 +11,9 @@
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
+#include "duckdb/planner/filter/in_filter.hpp"
+#include "duckdb/planner/filter/optional_filter.hpp"
+#include "duckdb/planner/filter/dynamic_filter.hpp"
 
 #include <cstring>
 
@@ -60,31 +63,30 @@ static bool EncodeConstant(const duckdb::Value &val, uint8_t mo_oid,
     out_bytes.resize(static_cast<size_t>(sz));
     out_len = static_cast<uint32_t>(sz);
     switch (static_cast<MOTypeOid>(mo_oid)) {
-    case MO_T_bool:    { auto v = val.GetValue<bool>();     memcpy(out_bytes.data(), &v, 1); break; }
-    case MO_T_int8:    { auto v = val.GetValue<int8_t>();   memcpy(out_bytes.data(), &v, 1); break; }
-    case MO_T_int16:   { auto v = val.GetValue<int16_t>();  memcpy(out_bytes.data(), &v, 2); break; }
-    case MO_T_int32:   { auto v = val.GetValue<int32_t>();  memcpy(out_bytes.data(), &v, 4); break; }
-    case MO_T_int64:   { auto v = val.GetValue<int64_t>();  memcpy(out_bytes.data(), &v, 8); break; }
-    case MO_T_uint8:   { auto v = val.GetValue<uint8_t>();  memcpy(out_bytes.data(), &v, 1); break; }
-    case MO_T_uint16:  { auto v = val.GetValue<uint16_t>(); memcpy(out_bytes.data(), &v, 2); break; }
-    case MO_T_uint32:  { auto v = val.GetValue<uint32_t>(); memcpy(out_bytes.data(), &v, 4); break; }
-    case MO_T_uint64:  { auto v = val.GetValue<uint64_t>(); memcpy(out_bytes.data(), &v, 8); break; }
-    case MO_T_float32: { auto v = val.GetValue<float>();    memcpy(out_bytes.data(), &v, 4); break; }
-    case MO_T_float64: { auto v = val.GetValue<double>();   memcpy(out_bytes.data(), &v, 8); break; }
+    case MO_T_bool:    { out_bytes[0] = val.GetValue<bool>() ? 1 : 0; break; }
+    case MO_T_int8:    { *reinterpret_cast<int8_t  *>(out_bytes.data()) = val.GetValue<int8_t>();   break; }
+    case MO_T_int16:   { *reinterpret_cast<int16_t *>(out_bytes.data()) = val.GetValue<int16_t>();  break; }
+    case MO_T_int32:   { *reinterpret_cast<int32_t *>(out_bytes.data()) = val.GetValue<int32_t>();  break; }
+    case MO_T_int64:   { *reinterpret_cast<int64_t *>(out_bytes.data()) = val.GetValue<int64_t>();  break; }
+    case MO_T_uint8:   { out_bytes[0] = val.GetValue<uint8_t>(); break; }
+    case MO_T_uint16:  { *reinterpret_cast<uint16_t *>(out_bytes.data()) = val.GetValue<uint16_t>(); break; }
+    case MO_T_uint32:  { *reinterpret_cast<uint32_t *>(out_bytes.data()) = val.GetValue<uint32_t>(); break; }
+    case MO_T_uint64:  { *reinterpret_cast<uint64_t *>(out_bytes.data()) = val.GetValue<uint64_t>(); break; }
+    case MO_T_float32: { *reinterpret_cast<float    *>(out_bytes.data()) = val.GetValue<float>();    break; }
+    case MO_T_float64: { *reinterpret_cast<double   *>(out_bytes.data()) = val.GetValue<double>();   break; }
     case MO_T_date: {
-        auto v = val.GetValue<int32_t>() + MO_UNIX_EPOCH_DAYS;
-        memcpy(out_bytes.data(), &v, 4);
+        *reinterpret_cast<int32_t *>(out_bytes.data()) =
+            val.GetValue<int32_t>() + MO_UNIX_EPOCH_DAYS;
         break;
     }
     case MO_T_datetime:
     case MO_T_timestamp: {
-        auto v = val.GetValue<int64_t>() + MO_UNIX_EPOCH_USEC;
-        memcpy(out_bytes.data(), &v, 8);
+        *reinterpret_cast<int64_t *>(out_bytes.data()) =
+            val.GetValue<int64_t>() + MO_UNIX_EPOCH_USEC;
         break;
     }
     case MO_T_time: {
-        auto v = val.GetValue<int64_t>();
-        memcpy(out_bytes.data(), &v, 8);
+        *reinterpret_cast<int64_t *>(out_bytes.data()) = val.GetValue<int64_t>();
         break;
     }
     case MO_T_decimal64: {
@@ -95,7 +97,7 @@ static bool EncodeConstant(const duckdb::Value &val, uint8_t mo_oid,
         case duckdb::PhysicalType::INT64: v = val.GetValueUnsafe<int64_t>(); break;
         default: return false;
         }
-        memcpy(out_bytes.data(), &v, 8);
+        *reinterpret_cast<int64_t *>(out_bytes.data()) = v;
         break;
     }
     case MO_T_decimal128: {
@@ -107,7 +109,7 @@ static bool EncodeConstant(const duckdb::Value &val, uint8_t mo_oid,
         case duckdb::PhysicalType::INT128: v = val.GetValueUnsafe<duckdb::hugeint_t>(); break;
         default: return false;
         }
-        memcpy(out_bytes.data(), &v, 16);
+        *reinterpret_cast<duckdb::hugeint_t *>(out_bytes.data()) = v;
         break;
     }
     case MO_T_uuid: {
@@ -164,6 +166,46 @@ void ExtractFilter(const duckdb::TableFilter &filter,
         }
         break;
     }
+    case duckdb::TableFilterType::IN_FILTER: {
+        auto &inf = filter.Cast<duckdb::InFilter>();
+        PushedFilter pf;
+        pf.col_idx = col_idx;
+        pf.seqnum = seqnum;
+        pf.mo_type_oid = mo_oid;
+        pf.op = FilterOp::IN_SET;
+        pf.const_len = 0;
+        pf.in_values.reserve(inf.values.size());
+        pf.in_value_lens.reserve(inf.values.size());
+        bool ok = true;
+        for (auto &val : inf.values) {
+            std::vector<uint8_t> bytes;
+            uint32_t len = 0;
+            if (!EncodeConstant(val, mo_oid, bytes, len)) { ok = false; break; }
+            pf.in_values.push_back(std::move(bytes));
+            pf.in_value_lens.push_back(len);
+        }
+        if (ok && !pf.in_values.empty()) {
+            out.push_back(std::move(pf));
+        }
+        break;
+    }
+    case duckdb::TableFilterType::OPTIONAL_FILTER: {
+        auto &of = filter.Cast<duckdb::OptionalFilter>();
+        if (of.child_filter) {
+            ExtractFilter(*of.child_filter, col_idx, seqnum, mo_oid, out);
+        }
+        break;
+    }
+    case duckdb::TableFilterType::DYNAMIC_FILTER: {
+        auto &df = filter.Cast<duckdb::DynamicFilter>();
+        if (df.filter_data) {
+            std::lock_guard<std::mutex> lk(df.filter_data->lock);
+            if (df.filter_data->initialized && df.filter_data->filter) {
+                ExtractFilter(*df.filter_data->filter, col_idx, seqnum, mo_oid, out);
+            }
+        }
+        break;
+    }
     default:
         break;
     }
@@ -172,6 +214,37 @@ void ExtractFilter(const duckdb::TableFilter &filter,
 // ===================================================================
 // Zone map evaluation
 // ===================================================================
+
+// Check if a single encoded scalar passes a zone-map test under `op`.
+static bool ZoneMapCheckScalar(const ZoneMap &zm, FilterOp op, uint8_t mo_oid,
+                                const uint8_t *bytes, uint32_t len) {
+    if (IsStringType(mo_oid)) {
+        return ZoneMapCheckString(zm, op, reinterpret_cast<const char *>(bytes), len);
+    }
+    switch (static_cast<MOTypeOid>(mo_oid)) {
+    case MO_T_bool:    return ZoneMapCheckFixed(zm, op, *reinterpret_cast<const bool *>(bytes));
+    case MO_T_int8:    return ZoneMapCheckFixed(zm, op, *reinterpret_cast<const int8_t *>(bytes));
+    case MO_T_int16:   return ZoneMapCheckFixed(zm, op, *reinterpret_cast<const int16_t *>(bytes));
+    case MO_T_int32:
+    case MO_T_date:    return ZoneMapCheckFixed(zm, op, *reinterpret_cast<const int32_t *>(bytes));
+    case MO_T_int64:
+    case MO_T_datetime:
+    case MO_T_timestamp:
+    case MO_T_time:    return ZoneMapCheckFixed(zm, op, *reinterpret_cast<const int64_t *>(bytes));
+    case MO_T_uint8:   return ZoneMapCheckFixed(zm, op, *reinterpret_cast<const uint8_t *>(bytes));
+    case MO_T_uint16:  return ZoneMapCheckFixed(zm, op, *reinterpret_cast<const uint16_t *>(bytes));
+    case MO_T_uint32:  return ZoneMapCheckFixed(zm, op, *reinterpret_cast<const uint32_t *>(bytes));
+    case MO_T_uint64:  return ZoneMapCheckFixed(zm, op, *reinterpret_cast<const uint64_t *>(bytes));
+    case MO_T_float32: return ZoneMapCheckFixed(zm, op, *reinterpret_cast<const float *>(bytes));
+    case MO_T_float64: return ZoneMapCheckFixed(zm, op, *reinterpret_cast<const double *>(bytes));
+    case MO_T_decimal64:  return ZoneMapCheckFixed(zm, op, *reinterpret_cast<const int64_t *>(bytes));
+    case MO_T_decimal128: return ZoneMapCheckFixed(zm, op, *reinterpret_cast<const duckdb::hugeint_t *>(bytes));
+    case MO_T_uuid:
+        return ZoneMapCheckString(zm, op, reinterpret_cast<const char *>(bytes), len);
+    default:
+        return true;
+    }
+}
 
 static bool EvalFilterOnZoneMap(const PushedFilter &pf,
                                  const uint8_t *zm_data) {
@@ -184,41 +257,18 @@ static bool EvalFilterOnZoneMap(const PushedFilter &pf,
         return true;
     }
 
-    if (IsStringType(pf.mo_type_oid)) {
-        return ZoneMapCheckString(zm, pf.op,
-                                   reinterpret_cast<const char *>(pf.constant.data()),
-                                   pf.const_len);
+    if (pf.op == FilterOp::IN_SET) {
+        for (std::size_t i = 0; i < pf.in_values.size(); ++i) {
+            if (ZoneMapCheckScalar(zm, FilterOp::EQUAL, pf.mo_type_oid,
+                                    pf.in_values[i].data(), pf.in_value_lens[i])) {
+                return true;
+            }
+        }
+        return false;
     }
 
-    switch (static_cast<MOTypeOid>(pf.mo_type_oid)) {
-    case MO_T_bool:    { bool v;     memcpy(&v, pf.constant.data(), 1); return ZoneMapCheckFixed(zm, pf.op, v); }
-    case MO_T_int8:    { int8_t v;   memcpy(&v, pf.constant.data(), 1); return ZoneMapCheckFixed(zm, pf.op, v); }
-    case MO_T_int16:   { int16_t v;  memcpy(&v, pf.constant.data(), 2); return ZoneMapCheckFixed(zm, pf.op, v); }
-    case MO_T_int32:
-    case MO_T_date:    { int32_t v;  memcpy(&v, pf.constant.data(), 4); return ZoneMapCheckFixed(zm, pf.op, v); }
-    case MO_T_int64:
-    case MO_T_datetime:
-    case MO_T_timestamp:
-    case MO_T_time: { int64_t v; memcpy(&v, pf.constant.data(), 8); return ZoneMapCheckFixed(zm, pf.op, v); }
-    case MO_T_uint8:   { uint8_t v;  memcpy(&v, pf.constant.data(), 1); return ZoneMapCheckFixed(zm, pf.op, v); }
-    case MO_T_uint16:  { uint16_t v; memcpy(&v, pf.constant.data(), 2); return ZoneMapCheckFixed(zm, pf.op, v); }
-    case MO_T_uint32:  { uint32_t v; memcpy(&v, pf.constant.data(), 4); return ZoneMapCheckFixed(zm, pf.op, v); }
-    case MO_T_uint64:  { uint64_t v; memcpy(&v, pf.constant.data(), 8); return ZoneMapCheckFixed(zm, pf.op, v); }
-    case MO_T_float32: { float v;    memcpy(&v, pf.constant.data(), 4); return ZoneMapCheckFixed(zm, pf.op, v); }
-    case MO_T_float64: { double v;   memcpy(&v, pf.constant.data(), 8); return ZoneMapCheckFixed(zm, pf.op, v); }
-    case MO_T_decimal64: { int64_t v; memcpy(&v, pf.constant.data(), 8); return ZoneMapCheckFixed(zm, pf.op, v); }
-    case MO_T_decimal128: {
-        duckdb::hugeint_t v; memcpy(&v, pf.constant.data(), 16);
-        return ZoneMapCheckFixed(zm, pf.op, v);
-    }
-    case MO_T_uuid: {
-        return ZoneMapCheckString(zm, pf.op,
-                                   reinterpret_cast<const char *>(pf.constant.data()),
-                                   pf.const_len);
-    }
-    default:
-        return true;
-    }
+    return ZoneMapCheckScalar(zm, pf.op, pf.mo_type_oid,
+                               pf.constant.data(), pf.const_len);
 }
 
 bool BlockPassesFilters(const std::vector<PushedFilter> &filters,
@@ -249,9 +299,8 @@ bool ZoneMapPassesFilters(const std::vector<PushedFilter> &filters,
 
 template <typename T>
 static bool CompareFixed(FilterOp op, const uint8_t *row_ptr, const uint8_t *const_ptr) {
-    T row_val, const_val;
-    memcpy(&row_val, row_ptr, sizeof(T));
-    memcpy(&const_val, const_ptr, sizeof(T));
+    T row_val = *reinterpret_cast<const T *>(row_ptr);
+    T const_val = *reinterpret_cast<const T *>(const_ptr);
     switch (op) {
     case FilterOp::EQUAL:                  return row_val == const_val;
     case FilterOp::NOT_EQUAL:              return row_val != const_val;
@@ -277,6 +326,89 @@ static bool RowPassesFilter(const PushedFilter &pf, const DecodedColumn &col,
     if (pf.op == FilterOp::IS_NULL) return is_null;
     if (pf.op == FilterOp::IS_NOT_NULL) return !is_null;
     if (is_null) return false;
+
+    if (pf.op == FilterOp::IN_SET) {
+        if (IsStringType(pf.mo_type_oid)) {
+            auto *slots = reinterpret_cast<const Varlena *>(col.data.data());
+            const Varlena &v = slots[row];
+            const char *str;
+            uint32_t str_len;
+            if (v.is_inline()) {
+                str = v.inline_data();
+                str_len = v.inline_length();
+            } else {
+                uint32_t off = v.big_offset();
+                str_len = v.big_length();
+                if (off + str_len > col.area.size()) return true;
+                str = reinterpret_cast<const char *>(col.area.data() + off);
+            }
+            for (std::size_t i = 0; i < pf.in_values.size(); ++i) {
+                if (pf.in_value_lens[i] == str_len &&
+                    memcmp(str, pf.in_values[i].data(), str_len) == 0) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        auto elem_size = MOTypeFixedSize(static_cast<MOTypeOid>(pf.mo_type_oid));
+        if (elem_size <= 0) return true;
+        const uint8_t *row_ptr = col.data.data() + row * static_cast<size_t>(elem_size);
+        for (std::size_t i = 0; i < pf.in_values.size(); ++i) {
+            const uint8_t *cp = pf.in_values[i].data();
+            bool hit = false;
+            switch (static_cast<MOTypeOid>(pf.mo_type_oid)) {
+            case MO_T_int8:
+            case MO_T_uint8:
+            case MO_T_bool:
+                hit = *row_ptr == *cp;
+                break;
+            case MO_T_int16:
+                hit = *reinterpret_cast<const int16_t *>(row_ptr) ==
+                      *reinterpret_cast<const int16_t *>(cp);
+                break;
+            case MO_T_uint16:
+                hit = *reinterpret_cast<const uint16_t *>(row_ptr) ==
+                      *reinterpret_cast<const uint16_t *>(cp);
+                break;
+            case MO_T_int32:
+            case MO_T_date:
+                hit = *reinterpret_cast<const int32_t *>(row_ptr) ==
+                      *reinterpret_cast<const int32_t *>(cp);
+                break;
+            case MO_T_uint32:
+                hit = *reinterpret_cast<const uint32_t *>(row_ptr) ==
+                      *reinterpret_cast<const uint32_t *>(cp);
+                break;
+            case MO_T_int64:
+            case MO_T_datetime:
+            case MO_T_timestamp:
+            case MO_T_time:
+            case MO_T_decimal64:
+                hit = *reinterpret_cast<const int64_t *>(row_ptr) ==
+                      *reinterpret_cast<const int64_t *>(cp);
+                break;
+            case MO_T_uint64:
+                hit = *reinterpret_cast<const uint64_t *>(row_ptr) ==
+                      *reinterpret_cast<const uint64_t *>(cp);
+                break;
+            case MO_T_float32:
+                hit = *reinterpret_cast<const float *>(row_ptr) ==
+                      *reinterpret_cast<const float *>(cp);
+                break;
+            case MO_T_float64:
+                hit = *reinterpret_cast<const double *>(row_ptr) ==
+                      *reinterpret_cast<const double *>(cp);
+                break;
+            case MO_T_decimal128:
+            case MO_T_uuid:
+                hit = memcmp(row_ptr, cp, 16) == 0;
+                break;
+            default: break;
+            }
+            if (hit) return true;
+        }
+        return false;
+    }
 
     if (IsStringType(pf.mo_type_oid)) {
         auto *slots = reinterpret_cast<const Varlena *>(col.data.data());

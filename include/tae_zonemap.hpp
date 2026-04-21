@@ -156,6 +156,7 @@ enum class FilterOp : uint8_t {
     LESS_THAN_OR_EQUAL,
     IS_NULL,
     IS_NOT_NULL,
+    IN_SET,
 };
 
 // Evaluate a filter against a zone map for a fixed-width numeric type.
