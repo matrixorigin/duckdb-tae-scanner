@@ -32,7 +32,6 @@ target_link_libraries(tae_tests PRIVATE
     dummy_static_extension_loader
     core_functions_extension
     parquet_extension
-    jemalloc_extension
     ${LZ4_LIBRARIES}
 )
 
