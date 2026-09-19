@@ -8,28 +8,27 @@
 // Execute: Read blocks from TAE objects, evaluate zone maps, fill DataChunk
 
 #include "tae_scanner.hpp"
-#include "tae_column_fill.hpp"
-#include "tae_filter.hpp"
-#include "tae_types.hpp"
 
-#include "duckdb/common/types/string_type.hpp"
+#include "duckdb/common/constants.hpp"
+#include "duckdb/common/file_open_flags.hpp"
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/common/table_column.hpp"
 #include "duckdb/common/types/date.hpp"
+#include "duckdb/common/types/string_type.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/parser/parsed_data/sample_options.hpp"
 #include "duckdb/planner/table_filter.hpp"
-#include "duckdb/storage/statistics/node_statistics.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
+#include "duckdb/storage/statistics/node_statistics.hpp"
 #include "duckdb/storage/statistics/numeric_stats.hpp"
 #include "duckdb/storage/statistics/string_stats.hpp"
-#include "duckdb/common/constants.hpp"
-#include "duckdb/common/table_column.hpp"
-#include "duckdb/parser/parsed_data/sample_options.hpp"
 #include "duckdb/storage/table/row_group_reorderer.hpp"
-
-#include "duckdb/common/file_system.hpp"
-#include "duckdb/common/file_open_flags.hpp"
-#include "duckdb/main/client_context.hpp"
+#include "tae_column_fill.hpp"
+#include "tae_filter.hpp"
+#include "tae_types.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -38,7 +37,7 @@
 
 // Minimal JSON parsing (header-only, bundled with DuckDB)
 #include "yyjson.hpp"
-using namespace duckdb_yyjson; // NOLINT
+using namespace duckdb_yyjson;  // NOLINT
 
 namespace tae {
 
@@ -77,27 +76,24 @@ static std::vector<uint8_t> HexDecode(const char *hex, size_t len) {
 //       {"path":"018e.../00001", "rows":8192, "blocks":1, "size":131072}, ...
 //     ]
 //   }
-static void ParseManifest(duckdb::ClientContext &context,
-                           const std::string &manifest_path,
-                           TAEScanBindData &bind) {
-    // Read manifest via DuckDB FileSystem (supports local files and HTTP URLs)
-    auto &fs = duckdb::FileSystem::GetFileSystem(context);
-    auto file_handle = fs.OpenFile(manifest_path,
-                                   duckdb::FileFlags::FILE_FLAGS_READ);
-    auto file_size = file_handle->GetFileSize();
-    std::string json_str(file_size, '\0');
-    file_handle->Read(const_cast<char *>(json_str.data()), file_size);
-    file_handle->Close();
-
-    yyjson_doc *doc = yyjson_read(json_str.c_str(), json_str.size(), 0);
+void ParseManifestBytes(std::string_view json_str, const std::string &data_root,
+                        TAEScanBindData &bind) {
+    if (json_str.empty() || json_str.size() > (64u << 20))
+        throw std::runtime_error("tae_scan: manifest size outside limit");
+    yyjson_doc *doc = yyjson_read(json_str.data(), json_str.size(), 0);
     if (!doc) throw std::runtime_error("tae_scan: invalid JSON in manifest");
+    std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> owned_doc(doc, yyjson_doc_free);
 
     yyjson_val *root = yyjson_doc_get_root(doc);
+    if (!yyjson_is_obj(root)) throw std::runtime_error("tae_scan: manifest root must be an object");
+    bool const empty_legacy_manifest = data_root.empty() && yyjson_obj_size(root) == 0;
 
     // Database / table names
     yyjson_val *db_val = yyjson_obj_get(root, "database");
     yyjson_val *tbl_val = yyjson_obj_get(root, "table");
-    if (db_val)  bind.db_name    = yyjson_get_str(db_val);
+    if (!empty_legacy_manifest && (!yyjson_is_str(db_val) || !yyjson_is_str(tbl_val)))
+        throw std::runtime_error("tae_scan: manifest database and table are required strings");
+    if (db_val) bind.db_name = yyjson_get_str(db_val);
     if (tbl_val) bind.table_name = yyjson_get_str(tbl_val);
 
     // Data directory from manifest (where object files are stored)
@@ -105,47 +101,93 @@ static void ParseManifest(duckdb::ClientContext &context,
     if (dir_val && yyjson_is_str(dir_val)) {
         bind.data_dir = yyjson_get_str(dir_val);
     }
+    if (!data_root.empty()) {
+        if (!bind.data_dir.empty() && bind.data_dir != data_root) {
+            throw std::runtime_error("tae_scan: manifest data root mismatch");
+        }
+        bind.data_dir = data_root;
+    }
 
     // Columns
     yyjson_val *cols = yyjson_obj_get(root, "columns");
+    if (!empty_legacy_manifest && (!yyjson_is_arr(cols) || yyjson_arr_size(cols) > 1024))
+        throw std::runtime_error("tae_scan: invalid manifest columns");
     size_t col_idx, col_max;
     yyjson_val *col_val;
-    yyjson_arr_foreach(cols, col_idx, col_max, col_val) {
-        bind.all_col_names.push_back(yyjson_get_str(yyjson_obj_get(col_val, "name")));
-        uint8_t oid = static_cast<uint8_t>(yyjson_get_int(yyjson_obj_get(col_val, "oid")));
-        bind.all_col_mo_oids.push_back(oid);
-        MOType mt = {};
-        mt.oid = oid;
-        auto *w = yyjson_obj_get(col_val, "width");
-        auto *s = yyjson_obj_get(col_val, "scale");
-        if (w) mt.width = static_cast<int32_t>(yyjson_get_int(w));
-        if (s) mt.scale = static_cast<int32_t>(yyjson_get_int(s));
-        bind.all_col_types.push_back(MOTypeToDuckDB(mt));
-    }
+    if (!empty_legacy_manifest) yyjson_arr_foreach(cols, col_idx, col_max, col_val) {
+            auto *name = yyjson_obj_get(col_val, "name");
+            auto *oid_val = yyjson_obj_get(col_val, "oid");
+            if (!yyjson_is_obj(col_val) || !yyjson_is_str(name) || yyjson_get_len(name) == 0 ||
+                !yyjson_is_int(oid_val) || yyjson_get_int(oid_val) < 0 ||
+                yyjson_get_int(oid_val) > 255)
+                throw std::runtime_error("tae_scan: invalid manifest column");
+            bind.all_col_names.push_back(yyjson_get_str(name));
+            uint8_t oid = static_cast<uint8_t>(yyjson_get_int(oid_val));
+            bind.all_col_mo_oids.push_back(oid);
+            MOType mt = {};
+            mt.oid = oid;
+            auto *w = yyjson_obj_get(col_val, "width");
+            auto *s = yyjson_obj_get(col_val, "scale");
+            if ((w && !yyjson_is_int(w)) || (s && !yyjson_is_int(s)))
+                throw std::runtime_error("tae_scan: invalid column width or scale");
+            if (w) mt.width = static_cast<int32_t>(yyjson_get_int(w));
+            if (s) mt.scale = static_cast<int32_t>(yyjson_get_int(s));
+            auto *q = yyjson_obj_get(col_val, "seqnum");
+            if (q && !yyjson_is_int(q)) throw std::runtime_error("tae_scan: invalid column seqnum");
+            auto seq = q ? yyjson_get_int(q) : static_cast<int64_t>(bind.all_col_seqnums.size());
+            if (seq < 0 || seq > UINT16_MAX ||
+                std::find(bind.all_col_seqnums.begin(), bind.all_col_seqnums.end(), seq) !=
+                    bind.all_col_seqnums.end()) {
+                throw std::runtime_error("tae_scan: invalid or duplicate column seqnum");
+            }
+            bind.all_col_widths.push_back(mt.width);
+            bind.all_col_scales.push_back(mt.scale);
+            bind.all_col_seqnums.push_back(static_cast<uint16_t>(seq));
+            bind.all_col_types.push_back(MOTypeToDuckDB(mt));
+        }
 
     // Objects
     yyjson_val *objs = yyjson_obj_get(root, "objects");
+    if (!empty_legacy_manifest && !yyjson_is_arr(objs))
+        throw std::runtime_error("tae_scan: invalid manifest objects");
     size_t obj_idx, obj_max;
     yyjson_val *obj_val;
-    yyjson_arr_foreach(objs, obj_idx, obj_max, obj_val) {
-        TAEObjectInfo info;
-        info.file_path  = yyjson_get_str(yyjson_obj_get(obj_val, "path"));
-        info.rows       = static_cast<uint32_t>(yyjson_get_int(yyjson_obj_get(obj_val, "rows")));
-        info.blocks     = static_cast<uint32_t>(yyjson_get_int(yyjson_obj_get(obj_val, "blocks")));
-        auto *sz = yyjson_obj_get(obj_val, "size");
-        info.size_bytes = sz ? static_cast<uint32_t>(yyjson_get_int(sz)) : 0;
-        // Optional: hex-encoded 64-byte zone map for the sort key column
-        auto *zm_val = yyjson_obj_get(obj_val, "zone_map");
-        if (zm_val && yyjson_is_str(zm_val)) {
-            auto zm_hex = yyjson_get_str(zm_val);
-            auto zm_len = yyjson_get_len(zm_val);
-            auto zm_bytes = HexDecode(zm_hex, zm_len);
-            if (zm_bytes.size() == 64) {
-                info.sort_key_zm = std::move(zm_bytes);
+    if (!empty_legacy_manifest) yyjson_arr_foreach(objs, obj_idx, obj_max, obj_val) {
+            auto *path_val = yyjson_obj_get(obj_val, "path");
+            auto *rows_val = yyjson_obj_get(obj_val, "rows");
+            auto *blocks_val = yyjson_obj_get(obj_val, "blocks");
+            if (!yyjson_is_obj(obj_val) || !yyjson_is_str(path_val) || !yyjson_is_uint(rows_val) ||
+                yyjson_get_uint(rows_val) > UINT32_MAX || !yyjson_is_uint(blocks_val) ||
+                yyjson_get_uint(blocks_val) > UINT32_MAX)
+                throw std::runtime_error("tae_scan: invalid manifest object");
+            TAEObjectInfo info;
+            info.file_path = yyjson_get_str(path_val);
+            auto object_path = std::filesystem::path(info.file_path);
+            if (object_path.is_absolute() || info.file_path.empty() ||
+                info.file_path.find('\\') != std::string::npos ||
+                info.file_path.find("://") != std::string::npos ||
+                std::any_of(object_path.begin(), object_path.end(),
+                            [](auto const &part) { return part == ".."; })) {
+                throw std::runtime_error("tae_scan: unsafe object path");
             }
+            info.rows = static_cast<uint32_t>(yyjson_get_uint(rows_val));
+            info.blocks = static_cast<uint32_t>(yyjson_get_uint(blocks_val));
+            auto *sz = yyjson_obj_get(obj_val, "size");
+            if (sz && (!yyjson_is_uint(sz) || yyjson_get_uint(sz) > UINT32_MAX))
+                throw std::runtime_error("tae_scan: invalid object size");
+            info.size_bytes = sz ? static_cast<uint32_t>(yyjson_get_uint(sz)) : 0;
+            // Optional: hex-encoded 64-byte zone map for the sort key column
+            auto *zm_val = yyjson_obj_get(obj_val, "zone_map");
+            if (zm_val && yyjson_is_str(zm_val)) {
+                auto zm_hex = yyjson_get_str(zm_val);
+                auto zm_len = yyjson_get_len(zm_val);
+                auto zm_bytes = HexDecode(zm_hex, zm_len);
+                if (zm_bytes.size() == 64) {
+                    info.sort_key_zm = std::move(zm_bytes);
+                }
+            }
+            bind.objects.push_back(std::move(info));
         }
-        bind.objects.push_back(std::move(info));
-    }
 
     // Compute totals for cardinality/progress estimation
     bind.total_rows = 0;
@@ -165,9 +207,21 @@ static void ParseManifest(duckdb::ClientContext &context,
                 break;
             }
         }
+        bind.embedded_manifest = true;
     }
+}
 
-    yyjson_doc_free(doc);
+static void ParseManifest(duckdb::ClientContext &context, const std::string &manifest_path,
+                          TAEScanBindData &bind) {
+    auto &fs = duckdb::FileSystem::GetFileSystem(context);
+    auto file_handle = fs.OpenFile(manifest_path, duckdb::FileFlags::FILE_FLAGS_READ);
+    auto file_size = file_handle->GetFileSize();
+    if (file_size > (64u << 20)) throw std::runtime_error("tae_scan: manifest exceeds limit");
+    std::string json_str(file_size, '\0');
+    file_handle->Read(json_str.data(), file_size);
+    file_handle->Close();
+    ParseManifestBytes(json_str, "", bind);
+    bind.embedded_manifest = false;
 }
 
 // ===================================================================
@@ -176,7 +230,7 @@ static void ParseManifest(duckdb::ClientContext &context,
 // Called by the RowGroupPruner optimizer when it detects ORDER BY ... LIMIT N.
 // We extract the relevant fields and store them in bind_data for Init to use.
 static void TAESetScanOrder(duckdb::unique_ptr<duckdb::RowGroupOrderOptions> options,
-                             duckdb::optional_ptr<duckdb::FunctionData> bind_data_p) {
+                            duckdb::optional_ptr<duckdb::FunctionData> bind_data_p) {
     if (!bind_data_p || !options) return;
     auto &bind = bind_data_p->Cast<TAEScanBindData>();
 
@@ -193,12 +247,9 @@ static void TAESetScanOrder(duckdb::unique_ptr<duckdb::RowGroupOrderOptions> opt
 // ===================================================================
 // Bind — parse manifest, set up projection, extract filters
 // ===================================================================
-static duckdb::unique_ptr<duckdb::FunctionData>
-TAEScanBind(duckdb::ClientContext &context,
-            duckdb::TableFunctionBindInput &input,
-            duckdb::vector<duckdb::LogicalType> &return_types,
-            duckdb::vector<duckdb::string> &names) {
-
+static duckdb::unique_ptr<duckdb::FunctionData> TAEScanBind(
+    duckdb::ClientContext &context, duckdb::TableFunctionBindInput &input,
+    duckdb::vector<duckdb::LogicalType> &return_types, duckdb::vector<duckdb::string> &names) {
     auto bind_data = duckdb::make_uniq<TAEScanBindData>();
     auto manifest_path = input.inputs[0].GetValue<std::string>();
 
@@ -226,9 +277,8 @@ TAEScanBind(duckdb::ClientContext &context,
 // ===================================================================
 // Init — set up scan state, resolve projection, extract pushed filters
 // ===================================================================
-static duckdb::unique_ptr<duckdb::GlobalTableFunctionState>
-TAEScanInit(duckdb::ClientContext &context,
-            duckdb::TableFunctionInitInput &input) {
+static duckdb::unique_ptr<duckdb::GlobalTableFunctionState> TAEScanInit(
+    duckdb::ClientContext &context, duckdb::TableFunctionInitInput &input) {
     auto &bind = input.bind_data->Cast<TAEScanBindData>();
     auto state = duckdb::make_uniq<TAEScanState>();
 
@@ -241,7 +291,9 @@ TAEScanInit(duckdb::ClientContext &context,
         auto id = static_cast<duckdb::column_t>(input.column_ids[ci]);
         if (!duckdb::IsVirtualColumn(id)) {
             col_ids_to_decoded[ci] = state->read_seqnums.size();
-            state->read_seqnums.push_back(static_cast<uint16_t>(id));
+            if (id >= bind.all_col_seqnums.size())
+                throw std::runtime_error("tae_scan: logical column outside schema");
+            state->read_seqnums.push_back(bind.all_col_seqnums[id]);
         }
     }
 
@@ -261,8 +313,7 @@ TAEScanInit(duckdb::ClientContext &context,
             state->output_map.push_back({OutputColumnInfo::VCOL_FILENAME, 0, 0});
         } else {
             state->output_map.push_back({OutputColumnInfo::TAE_COLUMN,
-                                         static_cast<duckdb::idx_t>(id),
-                                         col_ids_to_decoded[ci]});
+                                         static_cast<duckdb::idx_t>(id), col_ids_to_decoded[ci]});
         }
     }
 
@@ -284,10 +335,8 @@ TAEScanInit(duckdb::ClientContext &context,
             if (decoded_pos == UINT64_MAX) continue;
 
             uint8_t mo_oid = bind.all_col_mo_oids[table_col];
-            uint16_t seqnum = static_cast<uint16_t>(table_col);
-            ExtractFilter(filter,
-                          static_cast<uint16_t>(decoded_pos),
-                          seqnum, mo_oid,
+            uint16_t seqnum = bind.all_col_seqnums[table_col];
+            ExtractFilter(filter, static_cast<uint16_t>(decoded_pos), seqnum, mo_oid,
                           state->filters);
         }
     }
@@ -300,9 +349,9 @@ TAEScanInit(duckdb::ClientContext &context,
         } else {
             // Row-count based: approximate as percentage of total rows
             auto requested = opts.sample_size.GetValue<int64_t>();
-            state->sample_rate = bind.total_rows > 0
-                ? static_cast<double>(requested) / static_cast<double>(bind.total_rows)
-                : 1.0;
+            state->sample_rate = bind.total_rows > 0 ? static_cast<double>(requested) /
+                                                           static_cast<double>(bind.total_rows)
+                                                     : 1.0;
         }
         state->do_sample = state->sample_rate < 1.0;
     }
@@ -316,7 +365,8 @@ TAEScanInit(duckdb::ClientContext &context,
     if (!state->filters.empty()) {
         auto &fs = duckdb::FileSystem::GetFileSystem(context);
         uint16_t sort_seqnum = (bind.sort_column_idx >= 0)
-            ? static_cast<uint16_t>(bind.sort_column_idx) : UINT16_MAX;
+                                   ? bind.all_col_seqnums[static_cast<size_t>(bind.sort_column_idx)]
+                                   : UINT16_MAX;
 
         for (uint32_t obj = 0; obj < bind.objects.size(); obj++) {
             auto &obj_info = bind.objects[obj];
@@ -324,7 +374,7 @@ TAEScanInit(duckdb::ClientContext &context,
             // Fast path: object-level sort key zone map from manifest
             if (!obj_info.sort_key_zm.empty() && sort_seqnum != UINT16_MAX) {
                 if (!ZoneMapPassesFilters(state->filters, obj_info.sort_key_zm.data(),
-                                           sort_seqnum)) {
+                                          sort_seqnum)) {
                     // Sort key filter eliminates entire object — no metadata read needed
                     state->blocks_skipped.fetch_add(obj_info.blocks, std::memory_order_relaxed);
                     state->objects_skipped.fetch_add(1, std::memory_order_relaxed);
@@ -368,7 +418,7 @@ TAEScanInit(duckdb::ClientContext &context,
     if (bind.scan_order && !state->work_units.empty()) {
         auto &order = *bind.scan_order;
         if (order.column_idx < bind.all_col_mo_oids.size()) {
-            uint16_t order_seqnum = static_cast<uint16_t>(order.column_idx);
+            uint16_t order_seqnum = bind.all_col_seqnums[order.column_idx];
             auto mo_oid = static_cast<MOTypeOid>(bind.all_col_mo_oids[order.column_idx]);
             auto &col_type = bind.all_col_types[order.column_idx];
 
@@ -402,12 +452,14 @@ TAEScanInit(duckdb::ClientContext &context,
                     ZoneMap zmobj(zm);
                     if (order.use_min_stat) {
                         key = order.is_string
-                            ? duckdb::Value(ZoneMapBytesToString(zmobj.MinBuf(), zmobj.MinLen()))
-                            : ZoneMapBytesToValue(zmobj.MinBuf(), mo_oid, col_type);
+                                  ? duckdb::Value(
+                                        ZoneMapBytesToString(zmobj.MinBuf(), zmobj.MinLen()))
+                                  : ZoneMapBytesToValue(zmobj.MinBuf(), mo_oid, col_type);
                     } else {
                         key = order.is_string
-                            ? duckdb::Value(ZoneMapBytesToString(zmobj.MaxBuf(), zmobj.MaxLen()))
-                            : ZoneMapBytesToValue(zmobj.MaxBuf(), mo_oid, col_type);
+                                  ? duckdb::Value(
+                                        ZoneMapBytesToString(zmobj.MaxBuf(), zmobj.MaxLen()))
+                                  : ZoneMapBytesToValue(zmobj.MaxBuf(), mo_oid, col_type);
                     }
                 }
                 sortable.push_back({i, std::move(key)});
@@ -416,18 +468,18 @@ TAEScanInit(duckdb::ClientContext &context,
             // Sort: nulls go to the end regardless of direction
             if (order.ascending) {
                 std::sort(sortable.begin(), sortable.end(),
-                    [](const SortableUnit &a, const SortableUnit &b) {
-                        if (a.key.IsNull()) return false;
-                        if (b.key.IsNull()) return true;
-                        return a.key < b.key;
-                    });
+                          [](const SortableUnit &a, const SortableUnit &b) {
+                              if (a.key.IsNull()) return false;
+                              if (b.key.IsNull()) return true;
+                              return a.key < b.key;
+                          });
             } else {
                 std::sort(sortable.begin(), sortable.end(),
-                    [](const SortableUnit &a, const SortableUnit &b) {
-                        if (a.key.IsNull()) return false;
-                        if (b.key.IsNull()) return true;
-                        return a.key > b.key;
-                    });
+                          [](const SortableUnit &a, const SortableUnit &b) {
+                              if (a.key.IsNull()) return false;
+                              if (b.key.IsNull()) return true;
+                              return a.key > b.key;
+                          });
             }
 
             // Reorder work_units
@@ -459,18 +511,16 @@ TAEScanInit(duckdb::ClientContext &context,
 // ===================================================================
 // Init local — per-thread reader and state
 // ===================================================================
-static duckdb::unique_ptr<duckdb::LocalTableFunctionState>
-TAEScanInitLocal(duckdb::ExecutionContext &context,
-                 duckdb::TableFunctionInitInput &input,
-                 duckdb::GlobalTableFunctionState *global_state) {
+static duckdb::unique_ptr<duckdb::LocalTableFunctionState> TAEScanInitLocal(
+    duckdb::ExecutionContext &context, duckdb::TableFunctionInitInput &input,
+    duckdb::GlobalTableFunctionState *global_state) {
     return duckdb::make_uniq<TAEScanLocalState>();
 }
 
 // Compute per-block row count from manifest metadata (no file I/O).
 // Production MO blocks always have 8192 rows (except the last).
 // Handle small test data where total_rows < 8192 by distributing evenly.
-static inline duckdb::idx_t ManifestBlockRowCount(
-    const TAEObjectInfo &obj, uint32_t block_idx) {
+static inline duckdb::idx_t ManifestBlockRowCount(const TAEObjectInfo &obj, uint32_t block_idx) {
     constexpr duckdb::idx_t ROWS_PER_BLOCK = 8192;
     if (obj.blocks <= 1) return obj.rows;
     if (obj.rows <= ROWS_PER_BLOCK) {
@@ -488,14 +538,11 @@ static inline duckdb::idx_t ManifestBlockRowCount(
 // MO blocks have 8192 rows but DuckDB STANDARD_VECTOR_SIZE is 2048.
 // We buffer decoded columns in local state and emit ≤2048 rows per call.
 // ===================================================================
-static void TAEScanExecute(duckdb::ClientContext &context,
-                            duckdb::TableFunctionInput &input,
-                            duckdb::DataChunk &output) {
+static void TAEScanExecute(duckdb::ClientContext &context, duckdb::TableFunctionInput &input,
+                           duckdb::DataChunk &output) {
     auto &bind = input.bind_data->Cast<TAEScanBindData>();
     auto &gstate = input.global_state->Cast<TAEScanState>();
-    auto *lstate = input.local_state
-                       ? &input.local_state->Cast<TAEScanLocalState>()
-                       : nullptr;
+    auto *lstate = input.local_state ? &input.local_state->Cast<TAEScanLocalState>() : nullptr;
 
     // Fast path: no TAE columns to read and no row filters.
     // Emit row counts from manifest metadata without any file I/O.
@@ -512,16 +559,16 @@ static void TAEScanExecute(duckdb::ClientContext &context,
                 return;
             }
             auto &wu = gstate.work_units[wu_idx];
-            duckdb::idx_t total_rows = ManifestBlockRowCount(
-                bind.objects[wu.object_idx], wu.block_idx);
+            duckdb::idx_t total_rows =
+                ManifestBlockRowCount(bind.objects[wu.object_idx], wu.block_idx);
             if (lstate) {
                 lstate->pending_total_rows = total_rows;
                 lstate->pending_offset = 0;
                 lstate->pending_object_idx = wu.object_idx;
                 lstate->pending_block_idx = wu.block_idx;
             } else {
-                duckdb::idx_t chunk_rows = std::min(total_rows,
-                    static_cast<duckdb::idx_t>(STANDARD_VECTOR_SIZE));
+                duckdb::idx_t chunk_rows =
+                    std::min(total_rows, static_cast<duckdb::idx_t>(STANDARD_VECTOR_SIZE));
                 output.SetCardinality(chunk_rows);
                 gstate.rows_emitted.fetch_add(chunk_rows, std::memory_order_relaxed);
                 return;
@@ -529,34 +576,33 @@ static void TAEScanExecute(duckdb::ClientContext &context,
             goto emit_chunk_fast;
         }
 
-    emit_chunk_fast:
-        {
-            duckdb::idx_t src_offset = lstate->pending_offset;
-            duckdb::idx_t remaining = lstate->pending_total_rows - src_offset;
-            duckdb::idx_t chunk_rows = std::min(remaining,
-                static_cast<duckdb::idx_t>(STANDARD_VECTOR_SIZE));
-            output.SetCardinality(chunk_rows);
-            // Fill virtual columns only
-            for (duckdb::idx_t i = 0; i < gstate.output_map.size(); i++) {
-                auto &om = gstate.output_map[i];
-                if (om.kind == OutputColumnInfo::VCOL_FILENAME) {
-                    auto fname = bind.objects[lstate->pending_object_idx].file_path;
-                    auto target = duckdb::StringVector::AddString(output.data[i], fname);
-                    auto *data = duckdb::FlatVector::GetData<duckdb::string_t>(output.data[i]);
-                    std::fill_n(data, chunk_rows, target);
-                } else if (om.kind == OutputColumnInfo::VCOL_BLOCK_ID) {
-                    auto *data = duckdb::FlatVector::GetData<int32_t>(output.data[i]);
-                    std::fill_n(data, chunk_rows, static_cast<int32_t>(lstate->pending_block_idx));
-                }
+    emit_chunk_fast: {
+        duckdb::idx_t src_offset = lstate->pending_offset;
+        duckdb::idx_t remaining = lstate->pending_total_rows - src_offset;
+        duckdb::idx_t chunk_rows =
+            std::min(remaining, static_cast<duckdb::idx_t>(STANDARD_VECTOR_SIZE));
+        output.SetCardinality(chunk_rows);
+        // Fill virtual columns only
+        for (duckdb::idx_t i = 0; i < gstate.output_map.size(); i++) {
+            auto &om = gstate.output_map[i];
+            if (om.kind == OutputColumnInfo::VCOL_FILENAME) {
+                auto fname = bind.objects[lstate->pending_object_idx].file_path;
+                auto target = duckdb::StringVector::AddString(output.data[i], fname);
+                auto *data = duckdb::FlatVector::GetData<duckdb::string_t>(output.data[i]);
+                std::fill_n(data, chunk_rows, target);
+            } else if (om.kind == OutputColumnInfo::VCOL_BLOCK_ID) {
+                auto *data = duckdb::FlatVector::GetData<int32_t>(output.data[i]);
+                std::fill_n(data, chunk_rows, static_cast<int32_t>(lstate->pending_block_idx));
             }
-            lstate->pending_offset += chunk_rows;
-            if (lstate->pending_offset >= lstate->pending_total_rows) {
-                lstate->pending_total_rows = 0;
-                lstate->pending_offset = 0;
-            }
-            gstate.rows_emitted.fetch_add(chunk_rows, std::memory_order_relaxed);
-            return;
         }
+        lstate->pending_offset += chunk_rows;
+        if (lstate->pending_offset >= lstate->pending_total_rows) {
+            lstate->pending_total_rows = 0;
+            lstate->pending_offset = 0;
+        }
+        gstate.rows_emitted.fetch_add(chunk_rows, std::memory_order_relaxed);
+        return;
+    }
     }
 
 next_block:
@@ -583,8 +629,8 @@ next_block:
             reader = lstate->reader.get();
         } else {
             auto &fs = duckdb::FileSystem::GetFileSystem(context);
-            auto path = std::filesystem::path(bind.data_dir) /
-                        bind.objects[wu.object_idx].file_path;
+            auto path =
+                std::filesystem::path(bind.data_dir) / bind.objects[wu.object_idx].file_path;
             auto new_reader = std::make_unique<TAEObjectReader>(fs, path.string());
             new_reader->ReadMeta();
             if (lstate) {
@@ -598,8 +644,7 @@ next_block:
         }
 
         // Zone map filter: skip block if any filter rejects
-        if (!gstate.filters.empty() &&
-            !BlockPassesFilters(gstate.filters, *reader, wu.block_idx)) {
+        if (!gstate.filters.empty() && !BlockPassesFilters(gstate.filters, *reader, wu.block_idx)) {
             gstate.blocks_skipped.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
@@ -636,12 +681,13 @@ next_block:
             lstate->pending_block_idx = wu.block_idx;
         } else {
             // No local state — emit first STANDARD_VECTOR_SIZE rows only
-            duckdb::idx_t chunk_rows = std::min(total_rows,
-                                                 static_cast<duckdb::idx_t>(STANDARD_VECTOR_SIZE));
+            duckdb::idx_t chunk_rows =
+                std::min(total_rows, static_cast<duckdb::idx_t>(STANDARD_VECTOR_SIZE));
             output.SetCardinality(chunk_rows);
             for (duckdb::idx_t i = 0; i < gstate.output_map.size(); i++) {
                 auto &om = gstate.output_map[i];
-                if (om.kind == OutputColumnInfo::TAE_COLUMN && om.decoded_pos < decoded_cols.size()) {
+                if (om.kind == OutputColumnInfo::TAE_COLUMN &&
+                    om.decoded_pos < decoded_cols.size()) {
                     FillColumn(output.data[i], decoded_cols[om.decoded_pos], chunk_rows, 0);
                 }
             }
@@ -653,24 +699,23 @@ next_block:
         goto emit_chunk;
     }
 
-emit_chunk:
-    {
-        auto &pending_cols = lstate->pending_cols;
-        duckdb::idx_t src_offset = lstate->pending_offset;
-        duckdb::idx_t remaining = lstate->pending_total_rows - src_offset;
-        duckdb::idx_t chunk_rows = std::min(remaining,
-                                             static_cast<duckdb::idx_t>(STANDARD_VECTOR_SIZE));
+emit_chunk: {
+    auto &pending_cols = lstate->pending_cols;
+    duckdb::idx_t src_offset = lstate->pending_offset;
+    duckdb::idx_t remaining = lstate->pending_total_rows - src_offset;
+    duckdb::idx_t chunk_rows =
+        std::min(remaining, static_cast<duckdb::idx_t>(STANDARD_VECTOR_SIZE));
 
-        output.SetCardinality(chunk_rows);
+    output.SetCardinality(chunk_rows);
 
-        // Fill output columns
-        for (duckdb::idx_t i = 0; i < gstate.output_map.size(); i++) {
-            auto &om = gstate.output_map[i];
-            switch (om.kind) {
+    // Fill output columns
+    for (duckdb::idx_t i = 0; i < gstate.output_map.size(); i++) {
+        auto &om = gstate.output_map[i];
+        switch (om.kind) {
             case OutputColumnInfo::TAE_COLUMN:
                 if (om.decoded_pos < pending_cols.size()) {
-                    FillColumn(output.data[i], pending_cols[om.decoded_pos],
-                               chunk_rows, src_offset);
+                    FillColumn(output.data[i], pending_cols[om.decoded_pos], chunk_rows,
+                               src_offset);
                 }
                 break;
             case OutputColumnInfo::VCOL_FILENAME: {
@@ -685,64 +730,63 @@ emit_chunk:
                 std::fill_n(data, chunk_rows, static_cast<int32_t>(lstate->pending_block_idx));
                 break;
             }
+        }
+    }
+
+    // Apply per-row filtering
+    duckdb::idx_t filtered_count =
+        ApplyRowFilters(gstate.filters, pending_cols, output, chunk_rows, src_offset);
+
+    // Advance offset
+    lstate->pending_offset += chunk_rows;
+    if (lstate->pending_offset >= lstate->pending_total_rows) {
+        // Block fully emitted — clear pending state
+        lstate->pending_cols.clear();
+        lstate->pending_total_rows = 0;
+        lstate->pending_offset = 0;
+    }
+
+    if (filtered_count == 0) {
+        // All rows in this chunk filtered — try next chunk or block
+        if (lstate->pending_offset < lstate->pending_total_rows) {
+            goto emit_chunk;
+        }
+        // Block exhausted — loop back to grab next work unit.
+        // Do NOT return cardinality 0 here: DuckDB would interpret
+        // that as "scan complete" and stop calling us.
+        goto next_block;
+    }
+
+    // Apply Bernoulli sampling if requested
+    if (gstate.do_sample) {
+        duckdb::SelectionVector sel(filtered_count);
+        duckdb::idx_t sample_count = 0;
+        for (duckdb::idx_t i = 0; i < filtered_count; i++) {
+            if (lstate->dist(lstate->rng) <= gstate.sample_rate) {
+                sel.set_index(sample_count++, i);
             }
         }
-
-        // Apply per-row filtering
-        duckdb::idx_t filtered_count = ApplyRowFilters(
-            gstate.filters, pending_cols, output, chunk_rows, src_offset);
-
-        // Advance offset
-        lstate->pending_offset += chunk_rows;
-        if (lstate->pending_offset >= lstate->pending_total_rows) {
-            // Block fully emitted — clear pending state
-            lstate->pending_cols.clear();
-            lstate->pending_total_rows = 0;
-            lstate->pending_offset = 0;
-        }
-
-        if (filtered_count == 0) {
-            // All rows in this chunk filtered — try next chunk or block
+        if (sample_count == 0) {
             if (lstate->pending_offset < lstate->pending_total_rows) {
                 goto emit_chunk;
             }
-            // Block exhausted — loop back to grab next work unit.
-            // Do NOT return cardinality 0 here: DuckDB would interpret
-            // that as "scan complete" and stop calling us.
-            goto next_block;
+            output.SetCardinality(0);
+            return;
         }
-
-        // Apply Bernoulli sampling if requested
-        if (gstate.do_sample) {
-            duckdb::SelectionVector sel(filtered_count);
-            duckdb::idx_t sample_count = 0;
-            for (duckdb::idx_t i = 0; i < filtered_count; i++) {
-                if (lstate->dist(lstate->rng) <= gstate.sample_rate) {
-                    sel.set_index(sample_count++, i);
-                }
-            }
-            if (sample_count == 0) {
-                if (lstate->pending_offset < lstate->pending_total_rows) {
-                    goto emit_chunk;
-                }
-                output.SetCardinality(0);
-                return;
-            }
-            output.Slice(sel, sample_count);
-            filtered_count = sample_count;
-        }
-
-        gstate.rows_emitted.fetch_add(filtered_count, std::memory_order_relaxed);
-        return;
+        output.Slice(sel, sample_count);
+        filtered_count = sample_count;
     }
+
+    gstate.rows_emitted.fetch_add(filtered_count, std::memory_order_relaxed);
+    return;
+}
 }
 
 // ===================================================================
 // Cardinality — provide row-count estimate from manifest metadata
 // ===================================================================
-static duckdb::unique_ptr<duckdb::NodeStatistics>
-TAEScanCardinality(duckdb::ClientContext &context,
-                   const duckdb::FunctionData *bind_data_p) {
+static duckdb::unique_ptr<duckdb::NodeStatistics> TAEScanCardinality(
+    duckdb::ClientContext &context, const duckdb::FunctionData *bind_data_p) {
     if (!bind_data_p) return nullptr;
     auto &bind = bind_data_p->Cast<TAEScanBindData>();
     return duckdb::make_uniq<duckdb::NodeStatistics>(bind.total_rows, bind.total_rows);
@@ -752,10 +796,9 @@ TAEScanCardinality(duckdb::ClientContext &context,
 // Statistics — provide column-level min/max from zone maps
 // ===================================================================
 
-static duckdb::unique_ptr<duckdb::BaseStatistics>
-TAEScanStatistics(duckdb::ClientContext &context,
-                  const duckdb::FunctionData *bind_data_p,
-                  duckdb::column_t column_index) {
+static duckdb::unique_ptr<duckdb::BaseStatistics> TAEScanStatistics(
+    duckdb::ClientContext &context, const duckdb::FunctionData *bind_data_p,
+    duckdb::column_t column_index) {
     if (!bind_data_p) return nullptr;
     auto &bind = bind_data_p->Cast<TAEScanBindData>();
 
@@ -763,7 +806,7 @@ TAEScanStatistics(duckdb::ClientContext &context,
 
     auto &col_type = bind.all_col_types[column_index];
     auto oid = static_cast<MOTypeOid>(bind.all_col_mo_oids[column_index]);
-    uint16_t seqnum = static_cast<uint16_t>(column_index);
+    uint16_t seqnum = bind.all_col_seqnums[column_index];
 
     // Skip expensive column statistics for large object counts.
     // Each object requires reading file metadata (costly for CRC-wrapped files).
@@ -792,8 +835,10 @@ TAEScanStatistics(duckdb::ClientContext &context,
                 ZoneMap zmobj(zm);
 
                 if (IsStringType(oid)) {
-                    auto min_val = duckdb::Value(ZoneMapBytesToString(zmobj.MinBuf(), zmobj.MinLen()));
-                    auto max_val = duckdb::Value(ZoneMapBytesToString(zmobj.MaxBuf(), zmobj.MaxLen()));
+                    auto min_val =
+                        duckdb::Value(ZoneMapBytesToString(zmobj.MinBuf(), zmobj.MinLen()));
+                    auto max_val =
+                        duckdb::Value(ZoneMapBytesToString(zmobj.MaxBuf(), zmobj.MaxLen()));
                     if (!has_stats) {
                         global_min = std::move(min_val);
                         global_max = std::move(max_val);
@@ -818,13 +863,12 @@ TAEScanStatistics(duckdb::ClientContext &context,
 
                 // Check null count from column metadata
                 auto &blk_info = reader.Meta().blocks[blk];
-                if (seqnum < blk_info.columns.size() &&
-                    blk_info.columns[seqnum].null_cnt > 0) {
+                if (seqnum < blk_info.columns.size() && blk_info.columns[seqnum].null_cnt > 0) {
                     has_nulls = true;
                 }
             }
         } catch (...) {
-            return nullptr; // can't read → no stats
+            return nullptr;  // can't read → no stats
         }
     }
 
@@ -835,33 +879,33 @@ TAEScanStatistics(duckdb::ClientContext &context,
     if (!has_nulls) stats.SetHasNoNull();
 
     switch (col_type.InternalType()) {
-    case duckdb::PhysicalType::INT8:
-    case duckdb::PhysicalType::INT16:
-    case duckdb::PhysicalType::INT32:
-    case duckdb::PhysicalType::INT64:
-    case duckdb::PhysicalType::UINT8:
-    case duckdb::PhysicalType::UINT16:
-    case duckdb::PhysicalType::UINT32:
-    case duckdb::PhysicalType::UINT64:
-    case duckdb::PhysicalType::FLOAT:
-    case duckdb::PhysicalType::DOUBLE:
-    case duckdb::PhysicalType::BOOL:
-    case duckdb::PhysicalType::INT128:
-        duckdb::NumericStats::SetMin(stats, global_min);
-        duckdb::NumericStats::SetMax(stats, global_max);
-        break;
-    case duckdb::PhysicalType::VARCHAR: {
-        auto min_sv = duckdb::StringValue::Get(global_min);
-        auto max_sv = duckdb::StringValue::Get(global_max);
-        duckdb::StringStats::Update(stats, min_sv);
-        duckdb::StringStats::Update(stats, max_sv);
-        // Zone map min/max strings may be shorter than actual column values,
-        // so don't advertise max_string_length (which Update sets from these).
-        duckdb::StringStats::ResetMaxStringLength(stats);
-        break;
-    }
-    default:
-        return nullptr;
+        case duckdb::PhysicalType::INT8:
+        case duckdb::PhysicalType::INT16:
+        case duckdb::PhysicalType::INT32:
+        case duckdb::PhysicalType::INT64:
+        case duckdb::PhysicalType::UINT8:
+        case duckdb::PhysicalType::UINT16:
+        case duckdb::PhysicalType::UINT32:
+        case duckdb::PhysicalType::UINT64:
+        case duckdb::PhysicalType::FLOAT:
+        case duckdb::PhysicalType::DOUBLE:
+        case duckdb::PhysicalType::BOOL:
+        case duckdb::PhysicalType::INT128:
+            duckdb::NumericStats::SetMin(stats, global_min);
+            duckdb::NumericStats::SetMax(stats, global_max);
+            break;
+        case duckdb::PhysicalType::VARCHAR: {
+            auto min_sv = duckdb::StringValue::Get(global_min);
+            auto max_sv = duckdb::StringValue::Get(global_max);
+            duckdb::StringStats::Update(stats, min_sv);
+            duckdb::StringStats::Update(stats, max_sv);
+            // Zone map min/max strings may be shorter than actual column values,
+            // so don't advertise max_string_length (which Update sets from these).
+            duckdb::StringStats::ResetMaxStringLength(stats);
+            break;
+        }
+        default:
+            return nullptr;
     }
 
     return duckdb::make_uniq<duckdb::BaseStatistics>(std::move(stats));
@@ -878,24 +922,23 @@ static double TAEScanProgress(duckdb::ClientContext &context,
     auto &state = global_state->Cast<TAEScanState>();
 
     if (bind.total_blocks == 0) return 100.0;
-    double done = static_cast<double>(
-        state.blocks_scanned.load(std::memory_order_relaxed) +
-        state.blocks_skipped.load(std::memory_order_relaxed));
+    double done = static_cast<double>(state.blocks_scanned.load(std::memory_order_relaxed) +
+                                      state.blocks_skipped.load(std::memory_order_relaxed));
     return (done / static_cast<double>(bind.total_blocks)) * 100.0;
 }
 
 // ===================================================================
 // ToString — static info for EXPLAIN output
 // ===================================================================
-static duckdb::InsertionOrderPreservingMap<duckdb::string>
-TAEScanToString(duckdb::TableFunctionToStringInput &input) {
+static duckdb::InsertionOrderPreservingMap<duckdb::string> TAEScanToString(
+    duckdb::TableFunctionToStringInput &input) {
     duckdb::InsertionOrderPreservingMap<duckdb::string> result;
     if (!input.bind_data) return result;
     auto &bind = input.bind_data->Cast<TAEScanBindData>();
 
     if (!bind.table_name.empty()) {
-        result["Table"] = bind.db_name.empty() ? bind.table_name
-                                                : bind.db_name + "." + bind.table_name;
+        result["Table"] =
+            bind.db_name.empty() ? bind.table_name : bind.db_name + "." + bind.table_name;
     }
     result["Objects"] = std::to_string(bind.objects.size());
     result["Total Rows"] = std::to_string(bind.total_rows);
@@ -906,8 +949,8 @@ TAEScanToString(duckdb::TableFunctionToStringInput &input) {
 // ===================================================================
 // DynamicToString — runtime info for profiling
 // ===================================================================
-static duckdb::InsertionOrderPreservingMap<duckdb::string>
-TAEScanDynamicToString(duckdb::TableFunctionDynamicToStringInput &input) {
+static duckdb::InsertionOrderPreservingMap<duckdb::string> TAEScanDynamicToString(
+    duckdb::TableFunctionDynamicToStringInput &input) {
     duckdb::InsertionOrderPreservingMap<duckdb::string> result;
     if (!input.global_state) return result;
     auto &state = input.global_state->Cast<TAEScanState>();
@@ -926,7 +969,7 @@ TAEScanDynamicToString(duckdb::TableFunctionDynamicToStringInput &input) {
 // RowsScanned — actual row count for profiling
 // ===================================================================
 static duckdb::idx_t TAEScanRowsScanned(duckdb::GlobalTableFunctionState &global_state,
-                                         duckdb::LocalTableFunctionState &local_state) {
+                                        duckdb::LocalTableFunctionState &local_state) {
     auto &state = global_state.Cast<TAEScanState>();
     return state.rows_emitted.load(std::memory_order_relaxed);
 }
@@ -934,9 +977,8 @@ static duckdb::idx_t TAEScanRowsScanned(duckdb::GlobalTableFunctionState &global
 // ===================================================================
 // GetVirtualColumns — expose file_path and block_id virtual columns
 // ===================================================================
-static duckdb::virtual_column_map_t
-TAEScanGetVirtualColumns(duckdb::ClientContext &context,
-                         duckdb::optional_ptr<duckdb::FunctionData> bind_data) {
+static duckdb::virtual_column_map_t TAEScanGetVirtualColumns(
+    duckdb::ClientContext &context, duckdb::optional_ptr<duckdb::FunctionData> bind_data) {
     duckdb::virtual_column_map_t result;
     result.emplace(VCOL_FILENAME, duckdb::TableColumn("file_path", duckdb::LogicalType::VARCHAR));
     result.emplace(VCOL_BLOCK_ID, duckdb::TableColumn("block_id", duckdb::LogicalType::INTEGER));
@@ -952,27 +994,27 @@ static bool TAEScanSupportsPushdownType(const duckdb::FunctionData &bind_data_p,
     if (col_idx >= bind.all_col_types.size()) return false;
     auto &type = bind.all_col_types[col_idx];
     switch (type.id()) {
-    case duckdb::LogicalTypeId::TINYINT:
-    case duckdb::LogicalTypeId::SMALLINT:
-    case duckdb::LogicalTypeId::INTEGER:
-    case duckdb::LogicalTypeId::BIGINT:
-    case duckdb::LogicalTypeId::UTINYINT:
-    case duckdb::LogicalTypeId::USMALLINT:
-    case duckdb::LogicalTypeId::UINTEGER:
-    case duckdb::LogicalTypeId::UBIGINT:
-    case duckdb::LogicalTypeId::FLOAT:
-    case duckdb::LogicalTypeId::DOUBLE:
-    case duckdb::LogicalTypeId::BOOLEAN:
-    case duckdb::LogicalTypeId::DATE:
-    case duckdb::LogicalTypeId::TIMESTAMP:
-    case duckdb::LogicalTypeId::VARCHAR:
-    case duckdb::LogicalTypeId::DECIMAL:
-    case duckdb::LogicalTypeId::UUID:
-    case duckdb::LogicalTypeId::TIME:
-    case duckdb::LogicalTypeId::BLOB:
-        return true;
-    default:
-        return false;
+        case duckdb::LogicalTypeId::TINYINT:
+        case duckdb::LogicalTypeId::SMALLINT:
+        case duckdb::LogicalTypeId::INTEGER:
+        case duckdb::LogicalTypeId::BIGINT:
+        case duckdb::LogicalTypeId::UTINYINT:
+        case duckdb::LogicalTypeId::USMALLINT:
+        case duckdb::LogicalTypeId::UINTEGER:
+        case duckdb::LogicalTypeId::UBIGINT:
+        case duckdb::LogicalTypeId::FLOAT:
+        case duckdb::LogicalTypeId::DOUBLE:
+        case duckdb::LogicalTypeId::BOOLEAN:
+        case duckdb::LogicalTypeId::DATE:
+        case duckdb::LogicalTypeId::TIMESTAMP:
+        case duckdb::LogicalTypeId::VARCHAR:
+        case duckdb::LogicalTypeId::DECIMAL:
+        case duckdb::LogicalTypeId::UUID:
+        case duckdb::LogicalTypeId::TIME:
+        case duckdb::LogicalTypeId::BLOB:
+            return true;
+        default:
+            return false;
     }
 }
 
@@ -980,9 +1022,8 @@ static bool TAEScanSupportsPushdownType(const duckdb::FunctionData &bind_data_p,
 // GetTAEScanFunction — construct the TableFunction with filter pushdown
 // ===================================================================
 duckdb::TableFunction GetTAEScanFunction() {
-    duckdb::TableFunction func("tae_scan",
-                                {duckdb::LogicalType::VARCHAR},  // manifest path
-                                TAEScanExecute);
+    duckdb::TableFunction func("tae_scan", {duckdb::LogicalType::VARCHAR},  // manifest path
+                               TAEScanExecute);
     func.bind = TAEScanBind;
     func.init_global = TAEScanInit;
     func.init_local = TAEScanInitLocal;
@@ -1003,4 +1044,4 @@ duckdb::TableFunction GetTAEScanFunction() {
     return func;
 }
 
-} // namespace tae
+}  // namespace tae
