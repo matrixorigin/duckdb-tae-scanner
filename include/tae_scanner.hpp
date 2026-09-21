@@ -23,10 +23,6 @@
 #include <string_view>
 #include <vector>
 
-namespace sirius::embedding {
-class buffer_budget;
-}
-
 namespace tae {
 
 // Virtual column IDs (must be >= VIRTUAL_COLUMN_START = 2^63)
@@ -96,8 +92,6 @@ struct TAEScanBindData : public duckdb::TableFunctionData {
     std::vector<int32_t> all_col_widths;
     std::vector<int32_t> all_col_scales;
     std::vector<uint16_t> all_col_seqnums;  // logical index -> physical TAE seqnum
-    bool embedded_manifest = false;
-    std::shared_ptr<sirius::embedding::buffer_budget> embedded_host_budget;
 
     // Object list
     std::vector<TAEObjectInfo> objects;
@@ -121,8 +115,6 @@ struct TAEScanBindData : public duckdb::TableFunctionData {
         copy->all_col_widths = all_col_widths;
         copy->all_col_scales = all_col_scales;
         copy->all_col_seqnums = all_col_seqnums;
-        copy->embedded_manifest = embedded_manifest;
-        copy->embedded_host_budget = embedded_host_budget;
         copy->objects = objects;
         copy->total_rows = total_rows;
         copy->total_blocks = total_blocks;
@@ -198,8 +190,9 @@ struct TAEScanLocalState : public duckdb::LocalTableFunctionState {
 // Public API: register the tae_scan table function
 // ---------------------------------------------------------------------------
 duckdb::TableFunction GetTAEScanFunction();
-// Strict in-memory manifest entry point for native embedding. data_root is
-// authoritative; parsing performs no object or metadata I/O.
+// Parse storage metadata without object I/O or execution/runtime state.
+// A nonempty data_root is authoritative and requires identity and confined
+// relative object paths. Empty data_root preserves standalone path semantics.
 void ParseManifestBytes(std::string_view manifest, const std::string &data_root,
                         TAEScanBindData &bind);
 

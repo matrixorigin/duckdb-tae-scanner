@@ -41,6 +41,21 @@ SELECT count(*) FROM tae_scan('s3://bucket/manifests/lineitem.json');
 
 The manifest JSON describes the schema, object list, and data directory. Manifests are generated via MO's debug HTTP API (`/debug/tae/manifest`).
 
+### In-memory manifest parsing
+
+C++ consumers can call `tae::ParseManifestBytes(manifest, data_root, bind_data)`
+to parse a manifest without reading a file or any object payload. Manifests
+are limited to 64 MiB. A nonempty `data_root` is authoritative: database and
+table identity are required, a supplied manifest root must match, and object
+paths must be relative and contain no parent traversal. The standalone
+`tae_scan(path)` API keeps database/table identity optional.
+
+`TAEScanBindData` carries storage metadata, including column widths, scales,
+and physical sequence numbers. Execution mode and resource budgets belong
+to the consuming engine and are not inferred from optional `sort_column`
+metadata. Consumers of the earlier embedding fields must move that state
+into their own binding adapter when updating this dependency.
+
 ## Building
 
 This extension uses DuckDB's standard extension build system. DuckDB v1.5.1 is included as a Git submodule.

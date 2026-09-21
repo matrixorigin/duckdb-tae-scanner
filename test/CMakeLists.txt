@@ -15,6 +15,7 @@ add_executable(tae_tests
     test_types.cpp
     test_zonemap.cpp
     test_reader.cpp
+    test_manifest.cpp
     test_scan_basic.cpp
     test_scan_types.cpp
     test_scan_filters.cpp
