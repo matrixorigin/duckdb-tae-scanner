@@ -91,7 +91,8 @@ void ParseManifestBytes(std::string_view json_str, const std::string &data_root,
     // Database / table names
     yyjson_val *db_val = yyjson_obj_get(root, "database");
     yyjson_val *tbl_val = yyjson_obj_get(root, "table");
-    if (!empty_legacy_manifest && (!yyjson_is_str(db_val) || !yyjson_is_str(tbl_val)))
+    if ((db_val && !yyjson_is_str(db_val)) || (tbl_val && !yyjson_is_str(tbl_val)) ||
+        (!data_root.empty() && (!yyjson_is_str(db_val) || !yyjson_is_str(tbl_val))))
         throw std::runtime_error("tae_scan: manifest database and table are required strings");
     if (db_val) bind.db_name = yyjson_get_str(db_val);
     if (tbl_val) bind.table_name = yyjson_get_str(tbl_val);
@@ -163,11 +164,11 @@ void ParseManifestBytes(std::string_view json_str, const std::string &data_root,
             TAEObjectInfo info;
             info.file_path = yyjson_get_str(path_val);
             auto object_path = std::filesystem::path(info.file_path);
-            if (object_path.is_absolute() || info.file_path.empty() ||
+            if (!data_root.empty() && (object_path.is_absolute() || info.file_path.empty() ||
                 info.file_path.find('\\') != std::string::npos ||
                 info.file_path.find("://") != std::string::npos ||
                 std::any_of(object_path.begin(), object_path.end(),
-                            [](auto const &part) { return part == ".."; })) {
+                            [](auto const &part) { return part == ".."; }))) {
                 throw std::runtime_error("tae_scan: unsafe object path");
             }
             info.rows = static_cast<uint32_t>(yyjson_get_uint(rows_val));
@@ -207,7 +208,6 @@ void ParseManifestBytes(std::string_view json_str, const std::string &data_root,
                 break;
             }
         }
-        bind.embedded_manifest = true;
     }
 }
 
@@ -221,7 +221,6 @@ static void ParseManifest(duckdb::ClientContext &context, const std::string &man
     file_handle->Read(json_str.data(), file_size);
     file_handle->Close();
     ParseManifestBytes(json_str, "", bind);
-    bind.embedded_manifest = false;
 }
 
 // ===================================================================
