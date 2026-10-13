@@ -8,12 +8,9 @@
 
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/enums/expression_type.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
-#include "duckdb/planner/filter/conjunction_filter.hpp"
-#include "duckdb/planner/filter/null_filter.hpp"
-#include "duckdb/planner/filter/in_filter.hpp"
-#include "duckdb/planner/filter/optional_filter.hpp"
-#include "duckdb/planner/filter/dynamic_filter.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
 
 #include <cstring>
 
@@ -122,93 +119,87 @@ static bool EncodeConstant(const duckdb::Value &val, uint8_t mo_oid,
     return true;
 }
 
-void ExtractFilter(const duckdb::TableFilter &filter,
-                   uint16_t col_idx, uint16_t seqnum, uint8_t mo_oid,
-                   std::vector<PushedFilter> &out) {
-    switch (filter.filter_type) {
-    case duckdb::TableFilterType::CONSTANT_COMPARISON: {
-        auto &cf = filter.Cast<duckdb::ConstantFilter>();
-        FilterOp op;
-        if (!ConvertExprType(cf.comparison_type, op)) return;
-        PushedFilter pf;
-        pf.col_idx = col_idx;
-        pf.seqnum = seqnum;
-        pf.mo_type_oid = mo_oid;
-        pf.op = op;
-        if (!EncodeConstant(cf.constant, mo_oid, pf.constant, pf.const_len)) return;
-        out.push_back(std::move(pf));
-        break;
-    }
-    case duckdb::TableFilterType::IS_NULL: {
-        PushedFilter pf;
-        pf.col_idx = col_idx;
-        pf.seqnum = seqnum;
-        pf.mo_type_oid = mo_oid;
-        pf.op = FilterOp::IS_NULL;
-        pf.const_len = 0;
-        out.push_back(std::move(pf));
-        break;
-    }
-    case duckdb::TableFilterType::IS_NOT_NULL: {
-        PushedFilter pf;
-        pf.col_idx = col_idx;
-        pf.seqnum = seqnum;
-        pf.mo_type_oid = mo_oid;
-        pf.op = FilterOp::IS_NOT_NULL;
-        pf.const_len = 0;
-        out.push_back(std::move(pf));
-        break;
-    }
-    case duckdb::TableFilterType::CONJUNCTION_AND: {
-        auto &cf = filter.Cast<duckdb::ConjunctionAndFilter>();
-        for (auto &child : cf.child_filters) {
-            ExtractFilter(*child, col_idx, seqnum, mo_oid, out);
+bool SupportsFilterExpression(const duckdb::Expression &expr) {
+    using namespace duckdb;
+    if (ExpressionFilter::IsOptionalExpression(expr)) return true;
+    if (expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+        for (auto &child : expr.Cast<BoundConjunctionExpression>().GetChildren()) {
+            if (!SupportsFilterExpression(*child)) return false;
         }
-        break;
+        return true;
     }
-    case duckdb::TableFilterType::IN_FILTER: {
-        auto &inf = filter.Cast<duckdb::InFilter>();
-        PushedFilter pf;
-        pf.col_idx = col_idx;
-        pf.seqnum = seqnum;
-        pf.mo_type_oid = mo_oid;
+    if (BoundComparisonExpression::IsComparison(expr)) {
+        ExpressionType comparison;
+        FilterOp op;
+        auto constant = ExpressionFilter::TryGetColumnConstantComparison(
+            expr.Cast<BoundFunctionExpression>(), comparison);
+        return constant && !constant->GetValue().IsNull() && ConvertExprType(comparison, op);
+    }
+    if (expr.GetExpressionClass() != ExpressionClass::BOUND_OPERATOR) return false;
+    auto &children = expr.Cast<BoundOperatorExpression>().GetChildren();
+    if (children.empty() || !ExpressionFilter::IsSimpleFilterColumnRef(*children[0])) return false;
+    if (expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL ||
+        expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL) return children.size() == 1;
+    if (expr.GetExpressionType() != ExpressionType::COMPARE_IN) return false;
+    for (size_t i = 1; i < children.size(); ++i) {
+        if (children[i]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT ||
+            children[i]->Cast<BoundConstantExpression>().GetValue().IsNull()) return false;
+    }
+    return children.size() > 1;
+}
+
+static void ExtractExpression(const duckdb::Expression &expr,
+                              uint16_t col_idx, uint16_t seqnum, uint8_t mo_oid,
+                              std::vector<PushedFilter> &out) {
+    using namespace duckdb;
+    // Optional runtime filters may always be omitted without dropping required predicates.
+    if (ExpressionFilter::IsOptionalExpression(expr)) return;
+    if (expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+        for (auto &child : expr.Cast<BoundConjunctionExpression>().GetChildren())
+            ExtractExpression(*child, col_idx, seqnum, mo_oid, out);
+        return;
+    }
+    PushedFilter pf;
+    pf.col_idx = col_idx;
+    pf.seqnum = seqnum;
+    pf.mo_type_oid = mo_oid;
+    pf.const_len = 0;
+    if (BoundComparisonExpression::IsComparison(expr)) {
+        ExpressionType comparison;
+        auto constant = ExpressionFilter::TryGetColumnConstantComparison(
+            expr.Cast<BoundFunctionExpression>(), comparison);
+        if (!constant || !ConvertExprType(comparison, pf.op) ||
+            !EncodeConstant(constant->GetValue(), mo_oid, pf.constant, pf.const_len))
+            throw NotImplementedException("TAE cannot encode pushed comparison");
+    } else if (expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL) {
+        pf.op = FilterOp::IS_NULL;
+    } else if (expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL) {
+        pf.op = FilterOp::IS_NOT_NULL;
+    } else if (expr.GetExpressionType() == ExpressionType::COMPARE_IN) {
         pf.op = FilterOp::IN_SET;
-        pf.const_len = 0;
-        pf.in_values.reserve(inf.values.size());
-        pf.in_value_lens.reserve(inf.values.size());
-        bool ok = true;
-        for (auto &val : inf.values) {
+        auto &children = expr.Cast<BoundOperatorExpression>().GetChildren();
+        for (size_t i = 1; i < children.size(); ++i) {
             std::vector<uint8_t> bytes;
             uint32_t len = 0;
-            if (!EncodeConstant(val, mo_oid, bytes, len)) { ok = false; break; }
+            if (!EncodeConstant(children[i]->Cast<BoundConstantExpression>().GetValue(),
+                                mo_oid, bytes, len))
+                throw NotImplementedException("TAE cannot encode pushed IN value");
             pf.in_values.push_back(std::move(bytes));
             pf.in_value_lens.push_back(len);
         }
-        if (ok && !pf.in_values.empty()) {
-            out.push_back(std::move(pf));
-        }
-        break;
+    } else {
+        throw NotImplementedException("TAE does not support this pushed expression");
     }
-    case duckdb::TableFilterType::OPTIONAL_FILTER: {
-        auto &of = filter.Cast<duckdb::OptionalFilter>();
-        if (of.child_filter) {
-            ExtractFilter(*of.child_filter, col_idx, seqnum, mo_oid, out);
-        }
-        break;
-    }
-    case duckdb::TableFilterType::DYNAMIC_FILTER: {
-        auto &df = filter.Cast<duckdb::DynamicFilter>();
-        if (df.filter_data) {
-            std::lock_guard<std::mutex> lk(df.filter_data->lock);
-            if (df.filter_data->initialized && df.filter_data->filter) {
-                ExtractFilter(*df.filter_data->filter, col_idx, seqnum, mo_oid, out);
-            }
-        }
-        break;
-    }
-    default:
-        break;
-    }
+    out.push_back(std::move(pf));
+}
+
+void ExtractFilter(const duckdb::TableFilter &filter,
+                   uint16_t col_idx, uint16_t seqnum, uint8_t mo_oid,
+                   std::vector<PushedFilter> &out) {
+    auto &expr = *duckdb::ExpressionFilter::GetExpressionFilter(filter, "TAE filter").expr;
+    if (!SupportsFilterExpression(expr))
+        throw duckdb::NotImplementedException("TAE does not support this pushed filter");
+    ExtractExpression(expr, col_idx, seqnum, mo_oid, out);
 }
 
 // ===================================================================

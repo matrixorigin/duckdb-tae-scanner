@@ -28,6 +28,8 @@
 #include "duckdb/storage/table/row_group_reorderer.hpp"
 #include "tae_column_fill.hpp"
 #include "tae_filter.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
+#include "duckdb/main/profiler/profiling_node.hpp"
 #include "tae_types.hpp"
 
 #include <algorithm>
@@ -248,7 +250,7 @@ static void TAESetScanOrder(duckdb::unique_ptr<duckdb::RowGroupOrderOptions> opt
 // ===================================================================
 static duckdb::unique_ptr<duckdb::FunctionData> TAEScanBind(
     duckdb::ClientContext &context, duckdb::TableFunctionBindInput &input,
-    duckdb::vector<duckdb::LogicalType> &return_types, duckdb::vector<duckdb::string> &names) {
+    duckdb::vector<duckdb::LogicalType> &return_types, duckdb::vector<duckdb::Identifier> &names) {
     auto bind_data = duckdb::make_uniq<TAEScanBindData>();
     auto manifest_path = input.inputs[0].GetValue<std::string>();
 
@@ -266,7 +268,7 @@ static duckdb::unique_ptr<duckdb::FunctionData> TAEScanBind(
 
     // Return all columns to DuckDB (projection pushdown will select a subset)
     for (size_t i = 0; i < bind_data->all_col_names.size(); i++) {
-        names.push_back(bind_data->all_col_names[i]);
+        names.emplace_back(bind_data->all_col_names[i]);
         return_types.push_back(bind_data->all_col_types[i]);
     }
 
@@ -320,9 +322,9 @@ static duckdb::unique_ptr<duckdb::GlobalTableFunctionState> TAEScanInit(
     // entry.GetIndex() is a position in column_ids; we map it to
     // the decoded_cols position via col_ids_to_decoded.
     if (input.filters) {
-        for (auto &entry : input.filters->filters) {
-            auto ci = static_cast<duckdb::idx_t>(entry.first);
-            auto &filter = *entry.second;
+        for (auto &entry : *input.filters) {
+            auto ci = entry.GetIndex().GetIndex();
+            auto &filter = entry.Filter();
             if (ci >= input.column_ids.size()) continue;
 
             auto id = static_cast<duckdb::column_t>(input.column_ids[ci]);
@@ -587,10 +589,10 @@ static void TAEScanExecute(duckdb::ClientContext &context, duckdb::TableFunction
             if (om.kind == OutputColumnInfo::VCOL_FILENAME) {
                 auto fname = bind.objects[lstate->pending_object_idx].file_path;
                 auto target = duckdb::StringVector::AddString(output.data[i], fname);
-                auto *data = duckdb::FlatVector::GetData<duckdb::string_t>(output.data[i]);
+                auto *data = duckdb::FlatVector::GetDataMutable<duckdb::string_t>(output.data[i]);
                 std::fill_n(data, chunk_rows, target);
             } else if (om.kind == OutputColumnInfo::VCOL_BLOCK_ID) {
-                auto *data = duckdb::FlatVector::GetData<int32_t>(output.data[i]);
+                auto *data = duckdb::FlatVector::GetDataMutable<int32_t>(output.data[i]);
                 std::fill_n(data, chunk_rows, static_cast<int32_t>(lstate->pending_block_idx));
             }
         }
@@ -720,12 +722,12 @@ emit_chunk: {
             case OutputColumnInfo::VCOL_FILENAME: {
                 auto fname = bind.objects[lstate->pending_object_idx].file_path;
                 auto target = duckdb::StringVector::AddString(output.data[i], fname);
-                auto *data = duckdb::FlatVector::GetData<duckdb::string_t>(output.data[i]);
+                auto *data = duckdb::FlatVector::GetDataMutable<duckdb::string_t>(output.data[i]);
                 std::fill_n(data, chunk_rows, target);
                 break;
             }
             case OutputColumnInfo::VCOL_BLOCK_ID: {
-                auto *data = duckdb::FlatVector::GetData<int32_t>(output.data[i]);
+                auto *data = duckdb::FlatVector::GetDataMutable<int32_t>(output.data[i]);
                 std::fill_n(data, chunk_rows, static_cast<int32_t>(lstate->pending_block_idx));
                 break;
             }
@@ -948,29 +950,11 @@ static duckdb::InsertionOrderPreservingMap<duckdb::string> TAEScanToString(
 // ===================================================================
 // DynamicToString — runtime info for profiling
 // ===================================================================
-static duckdb::InsertionOrderPreservingMap<duckdb::string> TAEScanDynamicToString(
-    duckdb::TableFunctionDynamicToStringInput &input) {
-    duckdb::InsertionOrderPreservingMap<duckdb::string> result;
-    if (!input.global_state) return result;
+static void TAEScanGetMetrics(duckdb::TableFunctionGetMetricsInput &input) {
+    if (!input.global_state) return;
     auto &state = input.global_state->Cast<TAEScanState>();
-
-    result["Blocks Scanned"] = std::to_string(state.blocks_scanned.load(std::memory_order_relaxed));
-    result["Blocks Skipped"] = std::to_string(state.blocks_skipped.load(std::memory_order_relaxed));
-    auto obj_skip = state.objects_skipped.load(std::memory_order_relaxed);
-    if (obj_skip > 0) {
-        result["Objects Skipped"] = std::to_string(obj_skip);
-    }
-    result["Rows Emitted"] = std::to_string(state.rows_emitted.load(std::memory_order_relaxed));
-    return result;
-}
-
-// ===================================================================
-// RowsScanned — actual row count for profiling
-// ===================================================================
-static duckdb::idx_t TAEScanRowsScanned(duckdb::GlobalTableFunctionState &global_state,
-                                        duckdb::LocalTableFunctionState &local_state) {
-    auto &state = global_state.Cast<TAEScanState>();
-    return state.rows_emitted.load(std::memory_order_relaxed);
+    input.operator_metrics.rows_scanned = state.rows_emitted.load(std::memory_order_relaxed);
+    input.operator_metrics.row_groups_scanned = state.blocks_scanned.load(std::memory_order_relaxed);
 }
 
 // ===================================================================
@@ -1033,8 +1017,9 @@ duckdb::TableFunction GetTAEScanFunction() {
     func.statistics = TAEScanStatistics;
     func.table_scan_progress = TAEScanProgress;
     func.to_string = TAEScanToString;
-    func.dynamic_to_string = TAEScanDynamicToString;
-    func.rows_scanned = TAEScanRowsScanned;
+    func.get_metrics = TAEScanGetMetrics;
+    func.pushdown_expression = [](duckdb::ClientContext &, const duckdb::LogicalGet &,
+                                  duckdb::Expression &expr) { return SupportsFilterExpression(expr); };
     func.get_virtual_columns = TAEScanGetVirtualColumns;
     func.supports_pushdown_type = TAEScanSupportsPushdownType;
     func.sampling_pushdown = true;
