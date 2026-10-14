@@ -18,9 +18,9 @@ TEST_CASE("Scan: basic_3col returns all rows", "[scan]") {
     REQUIRE(result->ColumnCount() == 3);
 
     // Check column names
-    REQUIRE(result->names[0] == "col_int");
-    REQUIRE(result->names[1] == "col_str");
-    REQUIRE(result->names[2] == "col_dbl");
+    REQUIRE(result->GetNames()[0] == "col_int");
+    REQUIRE(result->GetNames()[1] == "col_str");
+    REQUIRE(result->GetNames()[2] == "col_dbl");
 }
 
 TEST_CASE("Scan: basic_3col data values", "[scan]") {
@@ -30,14 +30,14 @@ TEST_CASE("Scan: basic_3col data values", "[scan]") {
     REQUIRE_FALSE(result->HasError());
 
     // Row 0: col_int=10, col_str='alpha', col_dbl≈1.1
-    REQUIRE(result->GetValue(0, 0) == Value::INTEGER(10));
-    REQUIRE(result->GetValue(1, 0) == Value("alpha"));
-    REQUIRE(result->GetValue(2, 0).GetValue<double>() == Approx(1.1));
+    REQUIRE(result->Collection().GetValue(0, 0) == Value::INTEGER(10));
+    REQUIRE(result->Collection().GetValue(1, 0) == Value("alpha"));
+    REQUIRE(result->Collection().GetValue(2, 0).GetValue<double>() == Approx(1.1));
 
     // Row 7: col_int=80, col_str='theta', col_dbl≈8.8
-    REQUIRE(result->GetValue(0, 7) == Value::INTEGER(80));
-    REQUIRE(result->GetValue(1, 7) == Value("theta"));
-    REQUIRE(result->GetValue(2, 7).GetValue<double>() == Approx(8.8));
+    REQUIRE(result->Collection().GetValue(0, 7) == Value::INTEGER(80));
+    REQUIRE(result->Collection().GetValue(1, 7) == Value("theta"));
+    REQUIRE(result->Collection().GetValue(2, 7).GetValue<double>() == Approx(8.8));
 }
 
 // ===================================================================
@@ -51,7 +51,7 @@ TEST_CASE("Scan: projection pushdown reads only requested columns", "[scan]") {
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->ColumnCount() == 1);
     REQUIRE(result->RowCount() == 8);
-    REQUIRE(result->GetValue(0, 0) == Value("alpha"));
+    REQUIRE(result->Collection().GetValue(0, 0) == Value("alpha"));
 }
 
 // ===================================================================
@@ -65,8 +65,8 @@ TEST_CASE("Scan: multi_block reads across blocks", "[scan]") {
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->RowCount() == 8);
     // First block: 1,2,3,4; Second block: 100,200,300,400
-    REQUIRE(result->GetValue(0, 0) == Value::INTEGER(1));
-    REQUIRE(result->GetValue(0, 7) == Value::INTEGER(400));
+    REQUIRE(result->Collection().GetValue(0, 0) == Value::INTEGER(1));
+    REQUIRE(result->Collection().GetValue(0, 7) == Value::INTEGER(400));
 }
 
 // ===================================================================
@@ -83,14 +83,14 @@ TEST_CASE("Scan: multi-file reads across TAE objects", "[scan][multifile]") {
     REQUIRE(result->ColumnCount() == 3);
 
     // First file rows (sorted): 10..80
-    REQUIRE(result->GetValue(0, 0) == Value::INTEGER(10));
-    REQUIRE(result->GetValue(1, 0) == Value("alpha"));
+    REQUIRE(result->Collection().GetValue(0, 0) == Value::INTEGER(10));
+    REQUIRE(result->Collection().GetValue(1, 0) == Value("alpha"));
 
     // Last rows (from second file): 100..400
-    REQUIRE(result->GetValue(0, 8) == Value::INTEGER(100));
-    REQUIRE(result->GetValue(1, 8) == Value("one"));
-    REQUIRE(result->GetValue(0, 11) == Value::INTEGER(400));
-    REQUIRE(result->GetValue(1, 11) == Value("four"));
+    REQUIRE(result->Collection().GetValue(0, 8) == Value::INTEGER(100));
+    REQUIRE(result->Collection().GetValue(1, 8) == Value("one"));
+    REQUIRE(result->Collection().GetValue(0, 11) == Value::INTEGER(400));
+    REQUIRE(result->Collection().GetValue(1, 11) == Value("four"));
 }
 
 TEST_CASE("Scan: multi-file COUNT(*)", "[scan][multifile]") {
@@ -98,7 +98,7 @@ TEST_CASE("Scan: multi-file COUNT(*)", "[scan][multifile]") {
     auto result = Query(*db, "SELECT COUNT(*) FROM tae_scan('" +
                               ManifestPath("manifest_multifile.json") + "')");
     REQUIRE_FALSE(result->HasError());
-    REQUIRE(result->GetValue(0, 0) == Value::BIGINT(12));
+    REQUIRE(result->Collection().GetValue(0, 0) == Value::BIGINT(12));
 }
 
 TEST_CASE("Scan: multi-file filter crosses file boundary", "[scan][multifile]") {
@@ -110,8 +110,8 @@ TEST_CASE("Scan: multi-file filter crosses file boundary", "[scan][multifile]") 
                               "') WHERE col_int > 50 ORDER BY col_int");
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->RowCount() == 7);
-    REQUIRE(result->GetValue(0, 0) == Value::INTEGER(60));
-    REQUIRE(result->GetValue(0, 6) == Value::INTEGER(400));
+    REQUIRE(result->Collection().GetValue(0, 0) == Value::INTEGER(60));
+    REQUIRE(result->Collection().GetValue(0, 6) == Value::INTEGER(400));
 }
 
 // ===================================================================
@@ -126,20 +126,20 @@ TEST_CASE("Scan: with_nulls shows correct NULL values", "[scan]") {
     REQUIRE(result->RowCount() == 6);
 
     // Row 0: 10, 'hello'
-    REQUIRE(result->GetValue(0, 0) == Value::INTEGER(10));
-    REQUIRE(result->GetValue(1, 0) == Value("hello"));
+    REQUIRE(result->Collection().GetValue(0, 0) == Value::INTEGER(10));
+    REQUIRE(result->Collection().GetValue(1, 0) == Value("hello"));
 
     // Row 1: NULL, 'world'
-    REQUIRE(result->GetValue(0, 1).IsNull());
-    REQUIRE(result->GetValue(1, 1) == Value("world"));
+    REQUIRE(result->Collection().GetValue(0, 1).IsNull());
+    REQUIRE(result->Collection().GetValue(1, 1) == Value("world"));
 
     // Row 2: 30, NULL
-    REQUIRE(result->GetValue(0, 2) == Value::INTEGER(30));
-    REQUIRE(result->GetValue(1, 2).IsNull());
+    REQUIRE(result->Collection().GetValue(0, 2) == Value::INTEGER(30));
+    REQUIRE(result->Collection().GetValue(1, 2).IsNull());
 
     // Row 3: NULL, 'test'
-    REQUIRE(result->GetValue(0, 3).IsNull());
-    REQUIRE(result->GetValue(1, 3) == Value("test"));
+    REQUIRE(result->Collection().GetValue(0, 3).IsNull());
+    REQUIRE(result->Collection().GetValue(1, 3) == Value("test"));
 }
 
 // ===================================================================
@@ -155,8 +155,8 @@ TEST_CASE("Scan: zone map filter skips blocks", "[scan]") {
                               "') WHERE col_int > 50 ORDER BY col_int");
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->RowCount() == 4);
-    REQUIRE(result->GetValue(0, 0) == Value::INTEGER(100));
-    REQUIRE(result->GetValue(0, 3) == Value::INTEGER(400));
+    REQUIRE(result->Collection().GetValue(0, 0) == Value::INTEGER(100));
+    REQUIRE(result->Collection().GetValue(0, 3) == Value::INTEGER(400));
 }
 
 TEST_CASE("Scan: WHERE filters with no matching blocks", "[scan]") {
@@ -178,7 +178,7 @@ TEST_CASE("Scan: COUNT(*) works", "[scan]") {
     auto result = Query(*db, "SELECT COUNT(*) FROM tae_scan('" +
                               ManifestPath("manifest.json") + "')");
     REQUIRE_FALSE(result->HasError());
-    REQUIRE(result->GetValue(0, 0) == Value::BIGINT(8));
+    REQUIRE(result->Collection().GetValue(0, 0) == Value::BIGINT(8));
 }
 
 // ===================================================================
@@ -187,12 +187,12 @@ TEST_CASE("Scan: COUNT(*) works", "[scan]") {
 
 TEST_CASE("Scan: cardinality estimate appears in EXPLAIN", "[scan][stats]") {
     auto db = MakeDB();
-    auto result = Query(*db, "EXPLAIN SELECT * FROM tae_scan('" +
+    auto result = Query(*db, "EXPLAIN (FORMAT JSON) SELECT * FROM tae_scan('" +
                               ManifestPath("manifest.json") + "')");
     REQUIRE_FALSE(result->HasError());
-    auto explain_str = result->GetValue(1, 0).ToString();
-    // DuckDB uppercases the function name in EXPLAIN output
-    REQUIRE(explain_str.find("TAE_SCAN") != std::string::npos);
+    auto explain_str = result->Collection().GetValue(1, 0).ToString();
+    REQUIRE(explain_str.find("\"name\": \"TAE_SCAN\"") != std::string::npos);
+    REQUIRE(explain_str.find("\"Estimated Cardinality\": \"8\"") != std::string::npos);
 }
 
 TEST_CASE("Scan: cardinality single file = 8 rows", "[scan][stats]") {
@@ -201,7 +201,7 @@ TEST_CASE("Scan: cardinality single file = 8 rows", "[scan][stats]") {
     auto result = Query(*db, "SELECT COUNT(*) FROM tae_scan('" +
                               ManifestPath("manifest.json") + "')");
     REQUIRE_FALSE(result->HasError());
-    REQUIRE(result->GetValue(0, 0) == Value::BIGINT(8));
+    REQUIRE(result->Collection().GetValue(0, 0) == Value::BIGINT(8));
 }
 
 TEST_CASE("Scan: cardinality multi-file = 12 rows", "[scan][stats]") {
@@ -209,7 +209,7 @@ TEST_CASE("Scan: cardinality multi-file = 12 rows", "[scan][stats]") {
     auto result = Query(*db, "SELECT COUNT(*) FROM tae_scan('" +
                               ManifestPath("manifest_multifile.json") + "')");
     REQUIRE_FALSE(result->HasError());
-    REQUIRE(result->GetValue(0, 0) == Value::BIGINT(12));
+    REQUIRE(result->Collection().GetValue(0, 0) == Value::BIGINT(12));
 }
 
 TEST_CASE("Scan: column stats enable optimized filter elimination", "[scan][stats]") {
@@ -220,7 +220,7 @@ TEST_CASE("Scan: column stats enable optimized filter elimination", "[scan][stat
                               ManifestPath("manifest.json") +
                               "') WHERE col_int > 1000");
     REQUIRE_FALSE(result->HasError());
-    REQUIRE(result->GetValue(0, 0) == Value::BIGINT(0));
+    REQUIRE(result->Collection().GetValue(0, 0) == Value::BIGINT(0));
 }
 
 TEST_CASE("Scan: column stats min/max respected in range queries", "[scan][stats]") {
@@ -231,11 +231,11 @@ TEST_CASE("Scan: column stats min/max respected in range queries", "[scan][stats
                               ManifestPath("manifest.json") +
                               "') WHERE col_int >= 10 AND col_int <= 80");
     REQUIRE_FALSE(result->HasError());
-    REQUIRE(result->GetValue(0, 0) == Value::BIGINT(8));
+    REQUIRE(result->Collection().GetValue(0, 0) == Value::BIGINT(8));
 }
 
 // ===================================================================
-// EXPLAIN output (to_string / dynamic_to_string)
+// EXPLAIN output (to_string / get_metrics)
 // ===================================================================
 
 TEST_CASE("Scan: EXPLAIN shows table name and object count", "[scan][explain]") {
@@ -243,7 +243,7 @@ TEST_CASE("Scan: EXPLAIN shows table name and object count", "[scan][explain]") 
     auto result = Query(*db, "EXPLAIN SELECT * FROM tae_scan('" +
                               ManifestPath("manifest_multifile.json") + "')");
     REQUIRE_FALSE(result->HasError());
-    auto text = result->GetValue(1, 0).ToString();
+    auto text = result->Collection().GetValue(1, 0).ToString();
     REQUIRE(text.find("test_multifile") != std::string::npos);
     REQUIRE(text.find("Objects: 2") != std::string::npos);
     REQUIRE(text.find("Total Rows: 12") != std::string::npos);
@@ -251,12 +251,12 @@ TEST_CASE("Scan: EXPLAIN shows table name and object count", "[scan][explain]") 
 
 TEST_CASE("Scan: EXPLAIN ANALYZE shows runtime stats", "[scan][explain]") {
     auto db = MakeDB();
-    auto result = Query(*db, "EXPLAIN ANALYZE SELECT * FROM tae_scan('" +
+    auto result = Query(*db, "EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM tae_scan('" +
                               ManifestPath("manifest.json") + "')");
     REQUIRE_FALSE(result->HasError());
-    auto text = result->GetValue(1, 0).ToString();
-    REQUIRE(text.find("Blocks Scanned") != std::string::npos);
-    REQUIRE(text.find("Rows Emitted") != std::string::npos);
+    auto text = result->Collection().GetValue(1, 0).ToString();
+    REQUIRE(text.find("\"row_groups_scanned\": 1,") != std::string::npos);
+    REQUIRE(text.find("\"rows_scanned\": 8,") != std::string::npos);
 }
 
 // ===================================================================
@@ -272,10 +272,10 @@ TEST_CASE("Scan: parallel scan returns correct results for multi-block", "[scan]
                               "') ORDER BY col_int");
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->RowCount() == 8);
-    REQUIRE(result->GetValue(0, 0) == Value::INTEGER(1));
-    REQUIRE(result->GetValue(0, 3) == Value::INTEGER(4));
-    REQUIRE(result->GetValue(0, 4) == Value::INTEGER(100));
-    REQUIRE(result->GetValue(0, 7) == Value::INTEGER(400));
+    REQUIRE(result->Collection().GetValue(0, 0) == Value::INTEGER(1));
+    REQUIRE(result->Collection().GetValue(0, 3) == Value::INTEGER(4));
+    REQUIRE(result->Collection().GetValue(0, 4) == Value::INTEGER(100));
+    REQUIRE(result->Collection().GetValue(0, 7) == Value::INTEGER(400));
 }
 
 TEST_CASE("Scan: parallel scan correctness with multi-file", "[scan][parallel]") {
@@ -286,8 +286,8 @@ TEST_CASE("Scan: parallel scan correctness with multi-file", "[scan][parallel]")
                               "') ORDER BY col_int");
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->RowCount() == 12);
-    REQUIRE(result->GetValue(0, 0) == Value::INTEGER(10));
-    REQUIRE(result->GetValue(0, 11) == Value::INTEGER(400));
+    REQUIRE(result->Collection().GetValue(0, 0) == Value::INTEGER(10));
+    REQUIRE(result->Collection().GetValue(0, 11) == Value::INTEGER(400));
 }
 
 TEST_CASE("Scan: parallel scan with filter returns correct subset", "[scan][parallel]") {
@@ -297,8 +297,8 @@ TEST_CASE("Scan: parallel scan with filter returns correct subset", "[scan][para
                               "') WHERE col_int >= 100 ORDER BY col_int");
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->RowCount() == 4);
-    REQUIRE(result->GetValue(0, 0) == Value::INTEGER(100));
-    REQUIRE(result->GetValue(0, 3) == Value::INTEGER(400));
+    REQUIRE(result->Collection().GetValue(0, 0) == Value::INTEGER(100));
+    REQUIRE(result->Collection().GetValue(0, 3) == Value::INTEGER(400));
 }
 
 // ===================================================================
@@ -312,10 +312,10 @@ TEST_CASE("Scan: virtual column file_path returns object filename", "[scan][virt
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->RowCount() == 8);
     // All rows should have the same file path
-    auto val = result->GetValue(0, 0).ToString();
+    auto val = result->Collection().GetValue(0, 0).ToString();
     CHECK(val.find("basic_3col.tae") != std::string::npos);
     for (idx_t i = 1; i < result->RowCount(); i++) {
-        CHECK(result->GetValue(0, i).ToString() == val);
+        CHECK(result->Collection().GetValue(0, i).ToString() == val);
     }
 }
 
@@ -329,10 +329,10 @@ TEST_CASE("Scan: virtual column block_id returns block index", "[scan][virtual]"
     REQUIRE(result->RowCount() == 8);
     // First 4 rows should be block 0, next 4 block 1
     for (idx_t i = 0; i < 4; i++) {
-        CHECK(result->GetValue(0, i) == Value::INTEGER(0));
+        CHECK(result->Collection().GetValue(0, i) == Value::INTEGER(0));
     }
     for (idx_t i = 4; i < 8; i++) {
-        CHECK(result->GetValue(0, i) == Value::INTEGER(1));
+        CHECK(result->Collection().GetValue(0, i) == Value::INTEGER(1));
     }
 }
 
@@ -343,14 +343,14 @@ TEST_CASE("Scan: virtual columns mixed with TAE columns", "[scan][virtual]") {
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->RowCount() == 8);
     // Check TAE column values
-    CHECK(result->GetValue(0, 0) == Value::INTEGER(10));
-    CHECK(result->GetValue(0, 7) == Value::INTEGER(80));
+    CHECK(result->Collection().GetValue(0, 0) == Value::INTEGER(10));
+    CHECK(result->Collection().GetValue(0, 7) == Value::INTEGER(80));
     // file_path for all rows
-    auto fname = result->GetValue(1, 0).ToString();
+    auto fname = result->Collection().GetValue(1, 0).ToString();
     CHECK(fname.find("basic_3col.tae") != std::string::npos);
     // block_id should be 0 for single-block file
     for (idx_t i = 0; i < 8; i++) {
-        CHECK(result->GetValue(2, i) == Value::INTEGER(0));
+        CHECK(result->Collection().GetValue(2, i) == Value::INTEGER(0));
     }
 }
 
@@ -362,8 +362,8 @@ TEST_CASE("Scan: virtual columns with multi-file show different file paths", "[s
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->RowCount() == 12);
     // Rows from basic_3col.tae (int 10-80) and basic_3col_part2.tae (int 100-400)
-    auto fp_first = result->GetValue(1, 0).ToString();   // int=10 → basic_3col.tae
-    auto fp_last  = result->GetValue(1, 11).ToString();   // int=400 → basic_3col_part2.tae
+    auto fp_first = result->Collection().GetValue(1, 0).ToString();   // int=10 → basic_3col.tae
+    auto fp_last  = result->Collection().GetValue(1, 11).ToString();   // int=400 → basic_3col_part2.tae
     CHECK(fp_first.find("basic_3col.tae") != std::string::npos);
     CHECK(fp_last.find("basic_3col_part2.tae") != std::string::npos);
     CHECK(fp_first != fp_last);
@@ -425,14 +425,14 @@ TEST_CASE("Scan: constant int column returns same value for all rows", "[scan][c
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->RowCount() == 8);
     // Sorted: 10, 20, 30, 40, 42, 42, 42, 42
-    CHECK(result->GetValue(0, 0) == Value::INTEGER(10));
-    CHECK(result->GetValue(0, 1) == Value::INTEGER(20));
-    CHECK(result->GetValue(0, 2) == Value::INTEGER(30));
-    CHECK(result->GetValue(0, 3) == Value::INTEGER(40));
-    CHECK(result->GetValue(0, 4) == Value::INTEGER(42));
-    CHECK(result->GetValue(0, 5) == Value::INTEGER(42));
-    CHECK(result->GetValue(0, 6) == Value::INTEGER(42));
-    CHECK(result->GetValue(0, 7) == Value::INTEGER(42));
+    CHECK(result->Collection().GetValue(0, 0) == Value::INTEGER(10));
+    CHECK(result->Collection().GetValue(0, 1) == Value::INTEGER(20));
+    CHECK(result->Collection().GetValue(0, 2) == Value::INTEGER(30));
+    CHECK(result->Collection().GetValue(0, 3) == Value::INTEGER(40));
+    CHECK(result->Collection().GetValue(0, 4) == Value::INTEGER(42));
+    CHECK(result->Collection().GetValue(0, 5) == Value::INTEGER(42));
+    CHECK(result->Collection().GetValue(0, 6) == Value::INTEGER(42));
+    CHECK(result->Collection().GetValue(0, 7) == Value::INTEGER(42));
 }
 
 TEST_CASE("Scan: constant string column returns same value for all rows", "[scan][constant]") {
@@ -445,10 +445,10 @@ TEST_CASE("Scan: constant string column returns same value for all rows", "[scan
     REQUIRE(result->RowCount() == 8);
     // Block 0 has flat strings a,b,c,d; block 1 has constant 'hello'
     // Sorted: a, b, c, d, hello, hello, hello, hello
-    CHECK(result->GetValue(0, 0) == Value("a"));
-    CHECK(result->GetValue(0, 3) == Value("d"));
-    CHECK(result->GetValue(0, 4) == Value("hello"));
-    CHECK(result->GetValue(0, 7) == Value("hello"));
+    CHECK(result->Collection().GetValue(0, 0) == Value("a"));
+    CHECK(result->Collection().GetValue(0, 3) == Value("d"));
+    CHECK(result->Collection().GetValue(0, 4) == Value("hello"));
+    CHECK(result->Collection().GetValue(0, 7) == Value("hello"));
 }
 
 TEST_CASE("Scan: constant NULL double column returns NULLs", "[scan][constant]") {
@@ -462,11 +462,11 @@ TEST_CASE("Scan: constant NULL double column returns NULLs", "[scan][constant]")
     int null_count = 0;
     int nonnull_count = 0;
     for (idx_t i = 0; i < 8; i++) {
-        if (result->GetValue(0, i).IsNull()) {
+        if (result->Collection().GetValue(0, i).IsNull()) {
             null_count++;
         } else {
             nonnull_count++;
-            CHECK(result->GetValue(0, i).GetValue<double>() == Approx(3.14));
+            CHECK(result->Collection().GetValue(0, i).GetValue<double>() == Approx(3.14));
         }
     }
     CHECK(null_count == 4);      // block 1: 4 constant NULLs
@@ -481,7 +481,7 @@ TEST_CASE("Scan: mixed constant/flat columns work together", "[scan][constant]")
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->RowCount() == 8);
     // Row with col_int=10 comes from block 1 (int=FLAT, str=CONST 'hello', dbl=CONST_NULL)
-    CHECK(result->GetValue(0, 0) == Value::INTEGER(10));
-    CHECK(result->GetValue(1, 0) == Value("hello"));
-    CHECK(result->GetValue(2, 0).IsNull());
+    CHECK(result->Collection().GetValue(0, 0) == Value::INTEGER(10));
+    CHECK(result->Collection().GetValue(1, 0) == Value("hello"));
+    CHECK(result->Collection().GetValue(2, 0).IsNull());
 }

@@ -19,12 +19,12 @@ TEST_CASE("Scan: LZ4-compressed columns read correctly", "[lz4]") {
     REQUIRE(result->ColumnCount() == 3);
 
     // Same data as basic_3col: int32 [10..80], varchar, float64
-    CHECK(result->GetValue(0, 0) == Value::INTEGER(10));
-    CHECK(result->GetValue(0, 7) == Value::INTEGER(80));
-    CHECK(result->GetValue(1, 0).ToString() == "alpha");
-    CHECK(result->GetValue(1, 7).ToString() == "theta");
-    CHECK(result->GetValue(2, 0) == Value::DOUBLE(1.1));
-    CHECK(result->GetValue(2, 7) == Value::DOUBLE(8.8));
+    CHECK(result->Collection().GetValue(0, 0) == Value::INTEGER(10));
+    CHECK(result->Collection().GetValue(0, 7) == Value::INTEGER(80));
+    CHECK(result->Collection().GetValue(1, 0).ToString() == "alpha");
+    CHECK(result->Collection().GetValue(1, 7).ToString() == "theta");
+    CHECK(result->Collection().GetValue(2, 0) == Value::DOUBLE(1.1));
+    CHECK(result->Collection().GetValue(2, 7) == Value::DOUBLE(8.8));
 }
 
 TEST_CASE("Scan: LZ4-compressed with filter pushdown", "[lz4][filter]") {
@@ -34,12 +34,12 @@ TEST_CASE("Scan: LZ4-compressed with filter pushdown", "[lz4][filter]") {
                               "') WHERE col_int > 50 ORDER BY col_int");
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->RowCount() == 3);  // 60, 70, 80
-    CHECK(result->GetValue(0, 0) == Value::INTEGER(60));
-    CHECK(result->GetValue(0, 1) == Value::INTEGER(70));
-    CHECK(result->GetValue(0, 2) == Value::INTEGER(80));
-    CHECK(result->GetValue(1, 0).ToString() == "zeta");
-    CHECK(result->GetValue(1, 1).ToString() == "eta");
-    CHECK(result->GetValue(1, 2).ToString() == "theta");
+    CHECK(result->Collection().GetValue(0, 0) == Value::INTEGER(60));
+    CHECK(result->Collection().GetValue(0, 1) == Value::INTEGER(70));
+    CHECK(result->Collection().GetValue(0, 2) == Value::INTEGER(80));
+    CHECK(result->Collection().GetValue(1, 0).ToString() == "zeta");
+    CHECK(result->Collection().GetValue(1, 1).ToString() == "eta");
+    CHECK(result->Collection().GetValue(1, 2).ToString() == "theta");
 }
 
 TEST_CASE("Scan: LZ4-compressed with string filter", "[lz4][filter]") {
@@ -49,8 +49,8 @@ TEST_CASE("Scan: LZ4-compressed with string filter", "[lz4][filter]") {
                               "') WHERE col_str = 'gamma'");
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->RowCount() == 1);
-    CHECK(result->GetValue(0, 0) == Value::INTEGER(30));
-    CHECK(result->GetValue(1, 0).ToString() == "gamma");
+    CHECK(result->Collection().GetValue(0, 0) == Value::INTEGER(30));
+    CHECK(result->Collection().GetValue(1, 0).ToString() == "gamma");
 }
 
 TEST_CASE("Scan: LZ4-compressed projection subset", "[lz4]") {
@@ -61,8 +61,8 @@ TEST_CASE("Scan: LZ4-compressed projection subset", "[lz4]") {
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->RowCount() == 8);
     REQUIRE(result->ColumnCount() == 1);
-    CHECK(result->GetValue(0, 0) == Value::DOUBLE(1.1));
-    CHECK(result->GetValue(0, 4) == Value::DOUBLE(5.5));
+    CHECK(result->Collection().GetValue(0, 0) == Value::DOUBLE(1.1));
+    CHECK(result->Collection().GetValue(0, 4) == Value::DOUBLE(5.5));
 }
 
 TEST_CASE("Scan: LZ4-compressed EXPLAIN works", "[lz4]") {
@@ -86,9 +86,9 @@ TEST_CASE("Scan: ORDER BY ASC LIMIT returns correct values", "[orderby]") {
                               "') ORDER BY col_int ASC LIMIT 3");
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->RowCount() == 3);
-    CHECK(result->GetValue(0, 0) == Value::INTEGER(1));
-    CHECK(result->GetValue(0, 1) == Value::INTEGER(2));
-    CHECK(result->GetValue(0, 2) == Value::INTEGER(3));
+    CHECK(result->Collection().GetValue(0, 0) == Value::INTEGER(1));
+    CHECK(result->Collection().GetValue(0, 1) == Value::INTEGER(2));
+    CHECK(result->Collection().GetValue(0, 2) == Value::INTEGER(3));
 }
 
 TEST_CASE("Scan: ORDER BY DESC LIMIT returns correct values", "[orderby]") {
@@ -99,9 +99,9 @@ TEST_CASE("Scan: ORDER BY DESC LIMIT returns correct values", "[orderby]") {
                               "') ORDER BY col_int DESC LIMIT 3");
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->RowCount() == 3);
-    CHECK(result->GetValue(0, 0) == Value::INTEGER(400));
-    CHECK(result->GetValue(0, 1) == Value::INTEGER(300));
-    CHECK(result->GetValue(0, 2) == Value::INTEGER(200));
+    CHECK(result->Collection().GetValue(0, 0) == Value::INTEGER(400));
+    CHECK(result->Collection().GetValue(0, 1) == Value::INTEGER(300));
+    CHECK(result->Collection().GetValue(0, 2) == Value::INTEGER(200));
 }
 
 TEST_CASE("Scan: ORDER BY LIMIT larger than one block", "[orderby]") {
@@ -112,8 +112,8 @@ TEST_CASE("Scan: ORDER BY LIMIT larger than one block", "[orderby]") {
                               "') ORDER BY col_int ASC LIMIT 6");
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->RowCount() == 6);
-    CHECK(result->GetValue(0, 0) == Value::INTEGER(1));
-    CHECK(result->GetValue(0, 5) == Value::INTEGER(200));
+    CHECK(result->Collection().GetValue(0, 0) == Value::INTEGER(1));
+    CHECK(result->Collection().GetValue(0, 5) == Value::INTEGER(200));
 }
 
 TEST_CASE("Scan: ORDER BY without LIMIT still works", "[orderby]") {
@@ -124,8 +124,8 @@ TEST_CASE("Scan: ORDER BY without LIMIT still works", "[orderby]") {
                               "') ORDER BY col_int ASC");
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->RowCount() == 8);
-    CHECK(result->GetValue(0, 0) == Value::INTEGER(1));
-    CHECK(result->GetValue(0, 7) == Value::INTEGER(400));
+    CHECK(result->Collection().GetValue(0, 0) == Value::INTEGER(1));
+    CHECK(result->Collection().GetValue(0, 7) == Value::INTEGER(400));
 }
 
 TEST_CASE("Scan: sort_column parsed from manifest", "[orderby]") {
@@ -137,10 +137,10 @@ TEST_CASE("Scan: sort_column parsed from manifest", "[orderby]") {
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->RowCount() == 8);
     // First 4 rows from block 0: [1,2,3,4] with bools [T,F,T,F]
-    CHECK(result->GetValue(0, 0) == Value::INTEGER(1));
-    CHECK(result->GetValue(1, 0) == Value::BOOLEAN(true));
-    CHECK(result->GetValue(0, 1) == Value::INTEGER(2));
-    CHECK(result->GetValue(1, 1) == Value::BOOLEAN(false));
+    CHECK(result->Collection().GetValue(0, 0) == Value::INTEGER(1));
+    CHECK(result->Collection().GetValue(1, 0) == Value::BOOLEAN(true));
+    CHECK(result->Collection().GetValue(0, 1) == Value::INTEGER(2));
+    CHECK(result->Collection().GetValue(1, 1) == Value::BOOLEAN(false));
 }
 
 // ===================================================================
@@ -157,8 +157,8 @@ TEST_CASE("Scan: filter on non-projected column returns correct results", "[filt
     REQUIRE_FALSE(result->HasError());
     // basic_3col: gamma is at row index 2 → col_int=30, col_dbl=3.3
     REQUIRE(result->RowCount() == 1);
-    CHECK(result->GetValue(0, 0) == Value::INTEGER(30));
-    CHECK(result->GetValue(1, 0) == Value::DOUBLE(3.3));
+    CHECK(result->Collection().GetValue(0, 0) == Value::INTEGER(30));
+    CHECK(result->Collection().GetValue(1, 0) == Value::DOUBLE(3.3));
 }
 
 TEST_CASE("Scan: filter on non-projected numeric column", "[filter_prune]") {
@@ -174,9 +174,9 @@ TEST_CASE("Scan: filter on non-projected numeric column", "[filter_prune]") {
     // > 50 → rows with col_int 60, 70, 80 → col_str: zeta, eta, theta
     // ORDER BY col_str → eta, theta, zeta
     REQUIRE(result->RowCount() == 3);
-    CHECK(result->GetValue(0, 0).ToString() == "eta");
-    CHECK(result->GetValue(0, 1).ToString() == "theta");
-    CHECK(result->GetValue(0, 2).ToString() == "zeta");
+    CHECK(result->Collection().GetValue(0, 0).ToString() == "eta");
+    CHECK(result->Collection().GetValue(0, 1).ToString() == "theta");
+    CHECK(result->Collection().GetValue(0, 2).ToString() == "zeta");
 }
 
 TEST_CASE("Scan: filter on non-projected column with zone map skip", "[filter_prune]") {
@@ -201,14 +201,14 @@ TEST_CASE("Stats: MIN/MAX aggregates match zone map values", "[stats]") {
     auto r1 = Query(*db, "SELECT MIN(col_int), MAX(col_int) FROM tae_scan('" +
                           ManifestPath("manifest.json") + "')");
     REQUIRE_FALSE(r1->HasError());
-    CHECK(r1->GetValue(0, 0).GetValue<int32_t>() == 10);
-    CHECK(r1->GetValue(1, 0).GetValue<int32_t>() == 80);
+    CHECK(r1->Collection().GetValue(0, 0).GetValue<int32_t>() == 10);
+    CHECK(r1->Collection().GetValue(1, 0).GetValue<int32_t>() == 80);
 
     auto r2 = Query(*db, "SELECT MIN(col_dbl), MAX(col_dbl) FROM tae_scan('" +
                           ManifestPath("manifest.json") + "')");
     REQUIRE_FALSE(r2->HasError());
-    CHECK(std::abs(r2->GetValue(0, 0).GetValue<double>() - 1.1) < 0.01);
-    CHECK(std::abs(r2->GetValue(1, 0).GetValue<double>() - 8.8) < 0.01);
+    CHECK(std::abs(r2->Collection().GetValue(0, 0).GetValue<double>() - 1.1) < 0.01);
+    CHECK(std::abs(r2->Collection().GetValue(1, 0).GetValue<double>() - 8.8) < 0.01);
 }
 
 TEST_CASE("Stats: string MIN/MAX aggregates", "[stats]") {
@@ -218,8 +218,8 @@ TEST_CASE("Stats: string MIN/MAX aggregates", "[stats]") {
     auto result = Query(*db, "SELECT MIN(col_str), MAX(col_str) FROM tae_scan('" +
                               ManifestPath("manifest.json") + "')");
     REQUIRE_FALSE(result->HasError());
-    CHECK(result->GetValue(0, 0).ToString() == "alpha");
-    CHECK(result->GetValue(1, 0).ToString() == "zeta");
+    CHECK(result->Collection().GetValue(0, 0).ToString() == "alpha");
+    CHECK(result->Collection().GetValue(1, 0).ToString() == "zeta");
 }
 
 TEST_CASE("Stats: null column aggregates", "[stats]") {
@@ -229,10 +229,10 @@ TEST_CASE("Stats: null column aggregates", "[stats]") {
                           "FROM tae_scan('" + ManifestPath("manifest_nulls.json") + "')");
     if (r1->HasError()) { UNSCOPED_INFO("Error: " << r1->GetError()); }
     REQUIRE_FALSE(r1->HasError());
-    CHECK(r1->GetValue(0, 0).GetValue<int32_t>() == 10);   // MIN
-    CHECK(r1->GetValue(1, 0).GetValue<int32_t>() == 60);   // MAX
-    CHECK(r1->GetValue(2, 0).GetValue<int64_t>() == 6);    // COUNT(*)
-    CHECK(r1->GetValue(3, 0).GetValue<int64_t>() == 4);    // COUNT(col_int) excludes NULLs
+    CHECK(r1->Collection().GetValue(0, 0).GetValue<int32_t>() == 10);   // MIN
+    CHECK(r1->Collection().GetValue(1, 0).GetValue<int32_t>() == 60);   // MAX
+    CHECK(r1->Collection().GetValue(2, 0).GetValue<int64_t>() == 6);    // COUNT(*)
+    CHECK(r1->Collection().GetValue(3, 0).GetValue<int64_t>() == 4);    // COUNT(col_int) excludes NULLs
 }
 
 TEST_CASE("Stats: multifile min/max merge", "[stats]") {
@@ -241,8 +241,8 @@ TEST_CASE("Stats: multifile min/max merge", "[stats]") {
     auto result = Query(*db, "SELECT MIN(col_int), MAX(col_int) FROM tae_scan('" +
                               ManifestPath("manifest_multifile.json") + "')");
     REQUIRE_FALSE(result->HasError());
-    CHECK(result->GetValue(0, 0).GetValue<int32_t>() == 10);
-    CHECK(result->GetValue(1, 0).GetValue<int32_t>() == 400);
+    CHECK(result->Collection().GetValue(0, 0).GetValue<int32_t>() == 10);
+    CHECK(result->Collection().GetValue(1, 0).GetValue<int32_t>() == 400);
 }
 
 // ===================================================================
@@ -258,10 +258,10 @@ TEST_CASE("Partition prune: filter skips entire object via zone maps", "[partiti
         ManifestPath("manifest_multifile.json") + "') WHERE col_int > 90 ORDER BY col_int");
     REQUIRE_FALSE(result->HasError());
     CHECK(result->RowCount() == 4);
-    CHECK(result->GetValue(0, 0).GetValue<int32_t>() == 100);
-    CHECK(result->GetValue(0, 1).GetValue<int32_t>() == 200);
-    CHECK(result->GetValue(0, 2).GetValue<int32_t>() == 300);
-    CHECK(result->GetValue(0, 3).GetValue<int32_t>() == 400);
+    CHECK(result->Collection().GetValue(0, 0).GetValue<int32_t>() == 100);
+    CHECK(result->Collection().GetValue(0, 1).GetValue<int32_t>() == 200);
+    CHECK(result->Collection().GetValue(0, 2).GetValue<int32_t>() == 300);
+    CHECK(result->Collection().GetValue(0, 3).GetValue<int32_t>() == 400);
 }
 
 TEST_CASE("Partition prune: filter passes all objects", "[partition_prune]") {
@@ -271,7 +271,7 @@ TEST_CASE("Partition prune: filter passes all objects", "[partition_prune]") {
         "SELECT COUNT(*) FROM tae_scan('" +
         ManifestPath("manifest_multifile.json") + "') WHERE col_int > 0");
     REQUIRE_FALSE(result->HasError());
-    CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 12);
+    CHECK(result->Collection().GetValue(0, 0).GetValue<int64_t>() == 12);
 }
 
 TEST_CASE("Partition prune: filter skips all objects", "[partition_prune]") {
@@ -281,7 +281,7 @@ TEST_CASE("Partition prune: filter skips all objects", "[partition_prune]") {
         "SELECT COUNT(*) FROM tae_scan('" +
         ManifestPath("manifest_multifile.json") + "') WHERE col_int > 9999");
     REQUIRE_FALSE(result->HasError());
-    CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 0);
+    CHECK(result->Collection().GetValue(0, 0).GetValue<int64_t>() == 0);
 }
 
 TEST_CASE("Partition prune: manifest zone_map fast path skips object", "[partition_prune]") {
@@ -293,8 +293,8 @@ TEST_CASE("Partition prune: manifest zone_map fast path skips object", "[partiti
         ManifestPath("manifest_multifile_zm.json") + "') WHERE col_int > 90 ORDER BY col_int");
     REQUIRE_FALSE(result->HasError());
     CHECK(result->RowCount() == 4);
-    CHECK(result->GetValue(0, 0).GetValue<int32_t>() == 100);
-    CHECK(result->GetValue(0, 3).GetValue<int32_t>() == 400);
+    CHECK(result->Collection().GetValue(0, 0).GetValue<int32_t>() == 100);
+    CHECK(result->Collection().GetValue(0, 3).GetValue<int32_t>() == 400);
 }
 
 TEST_CASE("Partition prune: manifest zone_map passes all objects", "[partition_prune]") {
@@ -304,7 +304,7 @@ TEST_CASE("Partition prune: manifest zone_map passes all objects", "[partition_p
         "SELECT COUNT(*) FROM tae_scan('" +
         ManifestPath("manifest_multifile_zm.json") + "') WHERE col_int > 5");
     REQUIRE_FALSE(result->HasError());
-    CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 12);
+    CHECK(result->Collection().GetValue(0, 0).GetValue<int64_t>() == 12);
 }
 
 TEST_CASE("Partition prune: manifest zone_map skips all objects", "[partition_prune]") {
@@ -314,5 +314,5 @@ TEST_CASE("Partition prune: manifest zone_map skips all objects", "[partition_pr
         "SELECT COUNT(*) FROM tae_scan('" +
         ManifestPath("manifest_multifile_zm.json") + "') WHERE col_int > 9999");
     REQUIRE_FALSE(result->HasError());
-    CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 0);
+    CHECK(result->Collection().GetValue(0, 0).GetValue<int64_t>() == 0);
 }
