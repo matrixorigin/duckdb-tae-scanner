@@ -34,9 +34,12 @@ static unique_ptr<DuckDB> MakeDB() {
 }
 
 // Helper: run a query and return materialized result
-static unique_ptr<MaterializedQueryResult> Query(DuckDB &db, const string &sql) {
+static unique_ptr<QueryResult> Query(DuckDB &db, const string &sql) {
     Connection con(db);
-    return con.Query(sql);
+    auto result = con.Query(sql);
+    // v2 results are lazy; retain rows and execution errors before closing con.
+    result->Complete();
+    return result;
 }
 
 static std::string ManifestPath(const char *name) {

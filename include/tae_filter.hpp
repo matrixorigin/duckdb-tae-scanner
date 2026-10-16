@@ -9,11 +9,15 @@
 #include "tae_object_reader.hpp"
 #include "tae_zonemap.hpp"
 #include "duckdb.hpp"
+#include "duckdb/planner/table_filter.hpp"
+#include "duckdb/planner/expression.hpp"
 
 namespace tae {
 
 // Is this MO type OID a string/varlena type?
 bool IsStringType(uint8_t oid);
+
+bool SupportsFilterExpression(const duckdb::Expression &expr);
 
 // Extract DuckDB TableFilter(s) into PushedFilter list.
 void ExtractFilter(const duckdb::TableFilter &filter,

@@ -19,7 +19,7 @@ static void CopyFixedColumn(duckdb::Vector &out_vec,
                              duckdb::idx_t src_offset) {
     auto elem_size = MOTypeFixedSize(static_cast<MOTypeOid>(col.type.oid));
     if (elem_size <= 0) return;
-    auto *dst = duckdb::FlatVector::GetData(out_vec);
+    auto *dst = duckdb::FlatVector::GetDataMutable(out_vec);
     memcpy(dst, col.data.data() + src_offset * static_cast<size_t>(elem_size),
            count * static_cast<size_t>(elem_size));
 }
@@ -29,7 +29,7 @@ static void CopyDateColumn(duckdb::Vector &out_vec,
                             duckdb::idx_t count,
                             duckdb::idx_t src_offset) {
     auto *src = reinterpret_cast<const int32_t *>(col.data.data()) + src_offset;
-    auto *dst = duckdb::FlatVector::GetData<int32_t>(out_vec);
+    auto *dst = duckdb::FlatVector::GetDataMutable<int32_t>(out_vec);
     for (duckdb::idx_t i = 0; i < count; i++) {
         dst[i] = src[i] - MO_UNIX_EPOCH_DAYS;
     }
@@ -40,7 +40,7 @@ static void CopyTimestampColumn(duckdb::Vector &out_vec,
                                  duckdb::idx_t count,
                                  duckdb::idx_t src_offset) {
     auto *src = reinterpret_cast<const int64_t *>(col.data.data()) + src_offset;
-    auto *dst = duckdb::FlatVector::GetData<int64_t>(out_vec);
+    auto *dst = duckdb::FlatVector::GetDataMutable<int64_t>(out_vec);
     for (duckdb::idx_t i = 0; i < count; i++) {
         dst[i] = src[i] - MO_UNIX_EPOCH_USEC;
     }
@@ -74,7 +74,7 @@ static void CopyVarlenColumn(duckdb::Vector &out_vec,
         }
 
         auto target = duckdb::StringVector::AddString(out_vec, str_data, str_len);
-        duckdb::FlatVector::GetData<duckdb::string_t>(out_vec)[i] = target;
+        duckdb::FlatVector::GetDataMutable<duckdb::string_t>(out_vec)[i] = target;
     }
 }
 
@@ -84,7 +84,7 @@ static void CopyUuidColumn(duckdb::Vector &out_vec,
                             const DecodedColumn &col,
                             duckdb::idx_t count,
                             duckdb::idx_t src_offset) {
-    auto *dst = duckdb::FlatVector::GetData<duckdb::hugeint_t>(out_vec);
+    auto *dst = duckdb::FlatVector::GetDataMutable<duckdb::hugeint_t>(out_vec);
     const uint8_t *src = col.data.data() + src_offset * 16;
     for (duckdb::idx_t i = 0; i < count; i++) {
         dst[i] = duckdb::UUID::FromBlob(src + i * 16);
@@ -96,7 +96,7 @@ static void SetNullMask(duckdb::Vector &out_vec,
                          duckdb::idx_t count,
                          duckdb::idx_t src_offset) {
     if (col.null_count == 0) return;
-    auto &validity = duckdb::FlatVector::Validity(out_vec);
+    auto &validity = duckdb::FlatVector::ValidityMutable(out_vec);
     for (duckdb::idx_t i = 0; i < count; i++) {
         uint64_t src_row = src_offset + i;
         uint64_t word_idx = src_row / 64;

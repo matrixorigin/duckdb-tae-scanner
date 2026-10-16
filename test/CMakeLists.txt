@@ -30,11 +30,9 @@ target_include_directories(tae_tests PRIVATE
 
 target_link_libraries(tae_tests PRIVATE
     duckdb_static
-    dummy_static_extension_loader
-    core_functions_extension
-    parquet_extension
     ${LZ4_LIBRARIES}
 )
+duckdb_link_extensions(tae_tests PRIVATE core_functions parquet)
 
 # Link our extension's object files (reader + scanner logic)
 # We compile them as an OBJECT library so tests can access internal symbols.
